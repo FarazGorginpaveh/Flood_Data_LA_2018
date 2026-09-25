@@ -1,0 +1,372 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Sep 25 11:02:55 2026
+
+@author: mh01
+"""
+
+"""
+STEP 2 - Check what the USGS Louisiana 2018 data can (and cannot) support
+========================================================================
+Reads the output of 01_download_usgs_streamflow.py and produces:
+
+  figures/fig1_gauge_maps.png        where the gauges are, which parishes are covered
+  figures/fig2_data_quality.png      completeness, time step, thresholds, record length
+  figures/fig3_support_matrix.png    what the paper's metrics need vs. what we have
+  figures/fig4_2018_flood_stage.png  (only if continuous/ files are present)
+                                     gauges that went above NWS flood stage in 2018
+  data_check_report.txt              all numbers in plain text
+
+Requirements: pip install pandas matplotlib requests pyarrow
+Usage       : python 02_check_usgs_data.py
+              python 02_check_usgs_data.py --data-dir "D:\\some\\other\\folder"
+"""
+
+import argparse
+import json
+import re
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+from matplotlib.patches import Patch, Polygon
+from matplotlib.lines import Line2D
+
+DEFAULT_DATA_DIR = Path(r"D:\Tufts\Wishlist\Sepideh_2\data\usgs")
+PARISH_GEOJSON_URL = ("https://raw.githubusercontent.com/plotly/datasets/master/"
+                      "geojson-counties-fips.json")
+YEAR = 2018
+PAD_MINUTES = (pd.Timestamp("2019-01-31 23:59") - pd.Timestamp("2017-12-01")).total_seconds() / 60
+ALL_PARISHES = [f"22{c:03d}" for c in range(1, 128, 2)]
+MIN_PEAK_YEARS = 10     # minimum annual peaks for a flood-frequency estimate (Bulletin 17C)
+LOCAL_TZ = "America/Chicago"
+
+# NWS flood-stage labels vary a lot ("National Weather Service Floodstage, in feet",
+# "NWS Minor Flood Stage", ...). Keep flood / minor flood stage, not moderate/major.
+FLOOD_STAGE_RE = re.compile(r"(?:national weather service|nws).*flood\s*stage", re.I)
+NOT_BASE_STAGE_RE = re.compile(r"moderate|major|discharge", re.I)
+
+C_FLOW, C_STAGE, C_NONE, C_GREY = "#1f77b4", "#ff7f0e", "#d62728", "#bbbbbb"
+plt.rcParams.update({"font.size": 10, "axes.titleweight": "bold"})
+
+
+# ----------------------------------------------------------------------------
+def load_parish_shapes(data_dir):
+    """Louisiana parish outlines from the Census-based plotly GeoJSON (cached)."""
+    cache = data_dir / "la_parishes.geojson"
+    if not cache.exists():
+        try:
+            gj = requests.get(PARISH_GEOJSON_URL, timeout=120).json()
+            gj["features"] = [f for f in gj["features"] if f["id"].startswith("22")]
+            cache.write_text(json.dumps(gj))
+        except Exception as exc:  # maps still work, just without outlines
+            print(f"  ! could not download parish outlines ({exc}); maps without outlines")
+            return {}, {}
+    gj = json.loads(cache.read_text())
+    shapes, names = {}, {}
+    for f in gj["features"]:
+        g = f["geometry"]
+        polys = g["coordinates"] if g["type"] == "MultiPolygon" else [g["coordinates"]]
+        shapes[f["id"]] = [np.array(p[0]) for p in polys]
+        names[f["id"]] = f["properties"].get("NAME", f["id"])
+    return shapes, names
+
+
+def draw_parishes(ax, shapes, colors=None, edge="#666666"):
+    for fips, rings in shapes.items():
+        fc = (colors or {}).get(fips, "none")
+        for ring in rings:
+            ax.add_patch(Polygon(ring, closed=True, facecolor=fc, edgecolor=edge, lw=0.5))
+    ax.set_xlim(-94.1, -88.8)
+    ax.set_ylim(28.9, 33.1)
+    ax.set_aspect(1.15)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+def flood_stage_table(thr):
+    t = thr[thr["threshold_name"].fillna("").str.contains(FLOOD_STAGE_RE)
+            & ~thr["threshold_name"].fillna("").str.contains(NOT_BASE_STAGE_RE)
+            & (thr["parameter_code"] == "00065")].copy()
+    t["value"] = pd.to_numeric(t["value"], errors="coerce")
+    # if a gauge has several (old/new) values keep the lowest = first flooding
+    return t.groupby("monitoring_location_id")["value"].min()
+
+
+def read_any(path):
+    return pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
+
+
+# ----------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
+    ap.add_argument("--out-dir", default=None)
+    args = ap.parse_args()
+    data_dir = Path(args.data_dir)
+    out_dir = Path(args.out_dir) if args.out_dir else data_dir / "figures"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    sites = pd.read_csv(data_dir / "sites_LA.csv", dtype=str)
+    man = pd.read_csv(data_dir / "continuous_manifest.csv", dtype=str)
+    thr = pd.read_csv(data_dir / "thresholds_LA.csv", dtype=str)
+    peaks = pd.read_csv(data_dir / "annual_peaks_LA.csv", dtype=str)
+    for c in ("lon", "lat"):
+        sites[c] = pd.to_numeric(sites[c], errors="coerce")
+
+    # ---------- continuous 2018 gauges ---------------------------------------
+    ok = man[man["status"] == "ok"].copy()
+    for c in ("n_values", "median_step_min"):
+        ok[c] = pd.to_numeric(ok[c], errors="coerce")
+    # completeness proxy: values received / values expected at the median time step
+    ok["completeness"] = (ok["n_values"] * ok["median_step_min"] / PAD_MINUTES).clip(upper=1).fillna(0)
+
+    q_ids = set(ok.loc[ok.parameter_code == "00060", "monitoring_location_id"])
+    h_ids = set(ok.loc[ok.parameter_code == "00065", "monitoring_location_id"])
+    stage_only = h_ids - q_ids
+    gauges_2018 = q_ids | h_ids
+
+    # ---------- thresholds ----------------------------------------------------
+    fs = flood_stage_table(thr)
+    h_with_fs = h_ids & set(fs.index)
+    action_like = thr["threshold_name"].fillna("").str.contains(r"action", case=False)
+
+    # ---------- annual peaks (record length) ---------------------------------
+    pq = peaks[peaks["parameter_code"] == "00060"].copy()
+    pq["value"] = pd.to_numeric(pq["value"], errors="coerce")
+    pq = pq.dropna(subset=["value"])
+    n_years = pq.groupby("monitoring_location_id")["water_year"].nunique()
+    q_with_ffa = {s for s in q_ids if n_years.get(s, 0) >= MIN_PEAK_YEARS}
+
+    # ---------- parishes ------------------------------------------------------
+    s18 = sites[sites["monitoring_location_id"].isin(gauges_2018)]
+    par_q = set(s18.loc[s18.monitoring_location_id.isin(q_ids), "parish_fips"])
+    par_h = set(s18.loc[s18.monitoring_location_id.isin(h_ids), "parish_fips"]) - par_q
+    par_none = set(ALL_PARISHES) - par_q - par_h
+    shapes, names = load_parish_shapes(data_dir)
+
+    # ---------- optional: real 2018 data -------------------------------------
+    cont_dir = data_dir / "continuous"
+    exceed = None
+    if cont_dir.exists() and any(cont_dir.iterdir()):
+        print("Found continuous/ files - checking 2018 days-with-data and flood-stage exceedance ...")
+        comp, rows = {}, []
+        for f in sorted(cont_dir.glob("USGS-*_*.*")):
+            site, pc = f.name.split(".")[0].rsplit("_", 1)
+            df = read_any(f)
+            t = pd.to_datetime(df["time"], utc=True).dt.tz_convert(LOCAL_TZ)
+            v = pd.to_numeric(df["value"], errors="coerce")
+            in18 = (t.dt.year == YEAR) & v.notna()
+            comp[(site, pc)] = t[in18].dt.date.nunique() / 365
+            if pc == "00065" and site in fs.index:
+                daily_max = v[in18].groupby(t[in18].dt.date).max()
+                rows.append({"monitoring_location_id": site, "flood_stage_ft": fs[site],
+                             "max_stage_2018_ft": daily_max.max(),
+                             "days_above_flood_stage": int((daily_max > fs[site]).sum())})
+        ok["completeness"] = [comp.get((s, p), c) for s, p, c in
+                              zip(ok.monitoring_location_id, ok.parameter_code, ok.completeness)]
+        exceed = pd.DataFrame(rows)
+        if not exceed.empty:
+            exceed = exceed.merge(sites[["monitoring_location_id", "monitoring_location_name",
+                                         "parish_fips", "lon", "lat"]], how="left")
+            exceed.to_csv(data_dir / "flood_stage_exceedance_2018.csv", index=False)
+
+    poor = ok[ok["completeness"] < 0.8]
+
+    # =========================================================================
+    # FIGURE 1 - maps
+    # =========================================================================
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6.5))
+    ax = axes[0]
+    draw_parishes(ax, shapes)
+    ax.scatter(sites.lon, sites.lat, s=3, c=C_GREY, label=f"All USGS sites ever ({len(sites)})")
+    so = s18[s18.monitoring_location_id.isin(stage_only)]
+    sq = s18[s18.monitoring_location_id.isin(q_ids)]
+    ax.scatter(so.lon, so.lat, s=22, c=C_STAGE, edgecolor="k", lw=0.3,
+               label=f"2018 stage only ({len(stage_only)})")
+    ax.scatter(sq.lon, sq.lat, s=30, c=C_FLOW, edgecolor="k", lw=0.3,
+               label=f"2018 discharge ({len(q_ids)})")
+    sf = s18[s18.monitoring_location_id.isin(h_with_fs)]
+    ax.scatter(sf.lon, sf.lat, s=90, facecolor="none", edgecolor="k", lw=1.2,
+               label=f"Has NWS flood stage ({len(h_with_fs)})")
+    ax.set_title("A. USGS gauges with 15-min data in 2018")
+    ax.legend(loc="lower left", fontsize=8, framealpha=0.9)
+
+    ax = axes[1]
+    colors = {**{p: C_FLOW for p in par_q}, **{p: C_STAGE for p in par_h},
+              **{p: C_NONE for p in par_none}}
+    draw_parishes(ax, shapes, colors, edge="white")
+    ax.set_title("B. Parish coverage in 2018")
+    ax.legend(handles=[Patch(color=C_FLOW, label=f"Has discharge gauge ({len(par_q)})"),
+                       Patch(color=C_STAGE, label=f"Stage gauge only ({len(par_h)})"),
+                       Patch(color=C_NONE, label=f"No gauge at all ({len(par_none)})")],
+              loc="lower left", fontsize=8, framealpha=0.9)
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.93)
+    fig.savefig(out_dir / "fig1_gauge_maps.png", dpi=160)
+    plt.close(fig)
+
+    # =========================================================================
+    # FIGURE 2 - data quality
+    # =========================================================================
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+
+    ax = axes[0, 0]
+    bins = np.linspace(0, 1, 21)
+    ax.hist([ok.loc[ok.parameter_code == "00060", "completeness"],
+             ok.loc[ok.parameter_code == "00065", "completeness"]],
+            bins=bins, stacked=True, color=[C_FLOW, C_STAGE], label=["discharge", "gage height"])
+    ax.axvline(0.8, color="k", ls="--", lw=1)
+    ax.text(0.79, ax.get_ylim()[1] * 0.9, f"{len(poor)} series\n< 80% complete",
+            ha="right", va="top", fontsize=9)
+    ax.set(title="A. How complete is each 2018 record?",
+           xlabel="Fraction of record present" + ("" if exceed is not None else
+                                                  " (estimated from manifest)"),
+           ylabel="Number of series")
+    ax.legend()
+
+    ax = axes[0, 1]
+    step = ok["median_step_min"].fillna(-1).round().astype(int)
+    step = step.where(step.isin([5, 15, 30, 60]), -1).map(
+        {5: "5 min", 15: "15 min", 30: "30 min", 60: "60 min", -1: "irregular"})
+    order = ["5 min", "15 min", "30 min", "60 min", "irregular"]
+    cnt = step.value_counts().reindex(order, fill_value=0)
+    ax.bar(cnt.index, cnt.values, color="#4c72b0")
+    for i, v in enumerate(cnt.values):
+        ax.text(i, v, str(v), ha="center", va="bottom")
+    ax.set(title="B. Time step (all fine enough for rise time)", ylabel="Number of series")
+
+    ax = axes[1, 0]
+    cats = ["Discharge gauges", "Stage gauges"]
+    have = [len(q_with_ffa), len(h_with_fs)]
+    tot = [len(q_ids), len(h_ids)]
+    ax.barh(cats, tot, color=C_GREY, label="no usable threshold")
+    ax.barh(cats, have, color=["#2ca02c", "#2ca02c"], label="usable threshold")
+    for i, (h, t) in enumerate(zip(have, tot)):
+        ax.text(t, i, f"  {h} of {t}", va="center")
+    ax.set(title="C. Flood thresholds available",
+           xlabel="Gauges (green: discharge = >=10 yrs of peaks for a 2-yr flood;\n"
+                  "stage = NWS flood stage stored by USGS). Action stage: 0 gauges")
+    ax.legend(loc="lower right", fontsize=8)
+    ax.set_xlim(0, max(tot) * 1.25)
+
+    ax = axes[1, 1]
+    ny = n_years.reindex(sorted(q_ids)).fillna(0)
+    ax.hist(ny, bins=np.arange(0, ny.max() + 10, 5), color=C_FLOW)
+    ax.axvline(MIN_PEAK_YEARS, color="k", ls="--", lw=1)
+    ax.set(title="D. Years of annual peaks at the 2018 discharge gauges",
+           xlabel="Number of annual peaks", ylabel="Number of gauges")
+    fig.tight_layout()
+    fig.savefig(out_dir / "fig2_data_quality.png", dpi=160)
+    plt.close(fig)
+
+    # =========================================================================
+    # FIGURE 3 - support matrix
+    # =========================================================================
+    Y, P, N = "Yes", "Partly", "No"
+    rows = [
+        ("Gauge location and parish", Y, f"{len(gauges_2018)} gauges, parish FIPS for each"),
+        ("Timing within the day (rise time, duration)", Y,
+         f"5-30 min data; {len(ok) - len(poor)} of {len(ok)} series >= 80% complete"),
+        ("Magnitude as peak FLOW (like the paper)", P,
+         f"only {len(q_ids)} gauges measure flow; {len(stage_only)} measure stage only"),
+        ("Action-stage threshold (paper's event definition)", N,
+         "not stored by USGS; comes from NWS (NWPS)"),
+        ("NWS flood-stage threshold", P, f"{len(h_with_fs)} of {len(h_ids)} stage gauges"),
+        ("Statistical threshold (e.g. 2-yr flood from peaks)", P,
+         f"{len(q_with_ffa)} of {len(q_ids)} discharge gauges have >= {MIN_PEAK_YEARS} yrs"),
+        ("Frequency / severity for 2018", P, "yes at gauges that have a threshold"),
+        ("Every parish covered", N,
+         f"{len(par_none)} parishes have no gauge, {len(par_h)} only stage"),
+        ("Tidal / coastal flooding", P, "estuary gauges exist, but tides mix with floods"),
+        ("Flood extent, depth, damages", N, "point gauges only; need other data"),
+    ]
+    fig, ax = plt.subplots(figsize=(13, 5.2))
+    ax.axis("off")
+    col = {Y: "#b7e1b1", P: "#ffe08a", N: "#f4a6a6"}
+    tab = ax.table(cellText=[[a, b, c] for a, b, c in rows],
+                   colLabels=["What we need", "USGS data?", "Why"],
+                   colWidths=[0.36, 0.1, 0.54], loc="center", cellLoc="left")
+    tab.auto_set_font_size(False)
+    tab.set_fontsize(10)
+    tab.scale(1, 1.6)
+    for (r, c), cell in tab.get_celld().items():
+        if r == 0:
+            cell.set_facecolor("#333333")
+            cell.set_text_props(color="white", weight="bold")
+        elif c == 1:
+            cell.set_facecolor(col[rows[r - 1][1]])
+            cell.set_text_props(ha="center", weight="bold")
+    ax.set_title("What the USGS files can support for the Louisiana 2018 flood dataset",
+                 fontweight="bold", pad=6)
+    fig.tight_layout()
+    fig.savefig(out_dir / "fig3_support_matrix.png", dpi=160)
+    plt.close(fig)
+
+    # =========================================================================
+    # FIGURE 4 - 2018 flood-stage exceedance (only with local continuous files)
+    # =========================================================================
+    if exceed is not None and not exceed.empty:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6.5),
+                                 gridspec_kw={"width_ratios": [1, 1.1]})
+        ax = axes[0]
+        draw_parishes(ax, shapes)
+        e0 = exceed[exceed.days_above_flood_stage == 0]
+        e1 = exceed[exceed.days_above_flood_stage > 0]
+        ax.scatter(e0.lon, e0.lat, s=30, c=C_GREY, edgecolor="k", lw=0.3,
+                   label=f"Stayed below flood stage ({len(e0)})")
+        sc = ax.scatter(e1.lon, e1.lat, s=40 + 8 * e1.days_above_flood_stage,
+                        c=e1.days_above_flood_stage, cmap="Reds", edgecolor="k", lw=0.5,
+                        label=f"Went above flood stage ({len(e1)})")
+        fig.colorbar(sc, ax=ax, shrink=0.6, label="Days above flood stage in 2018")
+        ax.legend(loc="lower left", fontsize=8)
+        ax.set_title("A. Gauges above NWS flood stage in 2018")
+
+        ax = axes[1]
+        top = exceed.sort_values("days_above_flood_stage", ascending=True).tail(20)
+        ax.barh(top.monitoring_location_name.str.slice(0, 40), top.days_above_flood_stage,
+                color="#c0392b")
+        ax.set(title="B. Days above flood stage (top 20 gauges)", xlabel="Days in 2018")
+        fig.tight_layout()
+        fig.savefig(out_dir / "fig4_2018_flood_stage.png", dpi=160)
+        plt.close(fig)
+
+    # =========================================================================
+    # TEXT REPORT
+    # =========================================================================
+    def pname(f):
+        return f"{names.get(f, f)} ({f})"
+
+    lines = [
+        "USGS LOUISIANA 2018 - DATA CHECK",
+        "=" * 60,
+        f"Sites in inventory (all years)          : {len(sites)}",
+        f"Gauges with 15-min data in 2018         : {len(gauges_2018)}",
+        f"   measuring discharge                  : {len(q_ids)}",
+        f"   measuring stage only                 : {len(stage_only)}",
+        f"Series < 80% complete in 2018           : {len(poor)}",
+        f"Stage gauges with NWS flood stage       : {len(h_with_fs)} of {len(h_ids)}",
+        f"Threshold records mentioning 'action'   : {int(action_like.sum())}",
+        f"Discharge gauges with >= {MIN_PEAK_YEARS} yrs of peaks : {len(q_with_ffa)} of {len(q_ids)}",
+        "",
+        f"Parishes with a discharge gauge ({len(par_q)})",
+        f"Parishes with stage gauge only ({len(par_h)}): " + ", ".join(map(pname, sorted(par_h))),
+        f"Parishes with NO gauge ({len(par_none)}): " + ", ".join(map(pname, sorted(par_none))),
+        "",
+        "Incomplete series (< 80%):",
+        poor[["monitoring_location_id", "parameter_code", "completeness"]]
+        .round(2).to_string(index=False) if len(poor) else "  none",
+    ]
+    if exceed is not None and not exceed.empty:
+        lines += ["", f"Gauges above NWS flood stage in {YEAR}: "
+                  f"{(exceed.days_above_flood_stage > 0).sum()} of {len(exceed)}"]
+    report = "\n".join(lines)
+    (data_dir / "data_check_report.txt").write_text(report, encoding="utf-8")
+    print(report)
+    print(f"\nFigures saved in: {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
