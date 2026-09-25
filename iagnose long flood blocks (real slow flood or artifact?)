@@ -1,0 +1,382 @@
+"""
+STEP 7b - Diagnose long flood blocks (real slow flood or artifact?)
+===================================================================
+Finds every run of parish flood days that lasts >= LONG_DAYS (default 21) in
+parish_daily_2018.csv and lists WHICH reaches or gauges cause it, so you can
+tell a real slow river flood from a "stuck" reach or a tidal gauge.
+
+For each long block
+  NWM source : reaches flooding during the block, how many days each, their
+               longest single event, elevation (coastal?), stream order
+  USGS source: gauges flooding during the block, stage or discharge, site type,
+               drainage area, and whether the name suggests a canal, outlet,
+               pump station or other regulated / tidal site
+
+Suspects
+  NWM reach  : 'stuck' (one event >= LONG_DAYS, or flooding on >= 80% of the
+               block's days) or 'coastal' (elevation < 2 m)
+  USGS gauge : regulated/tidal (estuary/tidal site type, or a canal / outlet /
+               pump / flood-gate style name) or big river (Mississippi,
+               Atchafalaya, or > 10,000 sq mi drainage)
+
+Verdict per block: remove the suspects and recount the parish flood days.
+  >= 50% of the block's flood days disappear -> "stuck / coastal reaches",
+       "regulated/tidal gauges" (likely artifacts) or "big-river backwater"
+  otherwise NWM "widespread (likely real)" if many reaches flood each day,
+       else "mixed / check hydrographs"
+
+Outputs (data/diagnostics/)
+  long_blocks_2018.csv          one row per long block with its verdict
+  long_block_contributors.csv   the reaches / gauges behind each block
+  suggested_exclusions.csv      reaches / gauges the rules suggest removing
+                                (REVIEW before using it in step 7)
+  figures/diag_<parish>_<start>.png   map + hydrographs of top contributors
+
+Usage: python 07b_diagnose_long_blocks.py
+"""
+
+import argparse
+import json
+import re
+from pathlib import Path
+
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.patches import Polygon
+
+# ----------------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------------
+PROJECT_DIR = Path(r"D:\Tufts\Wishlist\Sepideh_2")
+YEAR = 2018
+LONG_DAYS = 21            # blocks at least this long are diagnosed
+GAP_DAYS = 3              # flood days separated by <= 3 dry days = same block
+MIN_REACHES, MIN_FRAC = 3, 0.01   # parish flood-day rule (same as step 7)
+STUCK_FRAC = 0.8          # a reach flooding on >= 80% of the block's days is 'stuck'
+LOST_SHARE = 0.5          # block is an artifact if removing suspects removes
+                          # >= 50% of its flood days
+COASTAL_ELEV_M = 2.0
+BIG_RIVER_SQMI = 10000
+REGULATED_RE = re.compile(r"canal|outlet|pump|flood ?gate|cutoff|giww|lock|spillway|"
+                          r"control|diversion|channel|pass\b", re.I)
+BIG_RIVER_RE = re.compile(r"mississippi|atchafalaya|morgan city|wax lake", re.I)
+N_HYDRO = 3               # hydrographs shown per block
+INCLUDE_BIG_RIVERS = False
+
+
+def set_paths(project_dir):
+    global USGS_DIR, NWM_DIR, EV_DIR, EVAL_DIR, FINAL_DIR, OUT_DIR, FIG_DIR
+    USGS_DIR = project_dir / "data" / "usgs"
+    NWM_DIR = project_dir / "data" / "nwm"
+    EV_DIR = project_dir / "data" / "events"
+    EVAL_DIR = project_dir / "data" / "evaluation"
+    FINAL_DIR = project_dir / "data" / "final"
+    OUT_DIR = project_dir / "data" / "diagnostics"
+    FIG_DIR = OUT_DIR / "figures"
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ----------------------------------------------------------------------------
+# HELPERS
+# ----------------------------------------------------------------------------
+def load_parishes():
+    gj = json.loads((USGS_DIR / "la_parishes.geojson").read_text())
+    shapes = {}
+    for f in gj["features"]:
+        g = f["geometry"]
+        polys = g["coordinates"] if g["type"] == "MultiPolygon" else [g["coordinates"]]
+        shapes[f["id"]] = [np.asarray(p[0]) for p in polys]
+    return shapes
+
+
+def expand_days(ev, id_col):
+    ev = ev.reset_index(drop=True)
+    s = pd.to_datetime(ev["start_date_local"]).clip(lower=pd.Timestamp(f"{YEAR}-01-01"))
+    e = pd.to_datetime(ev["end_date_local"]).clip(upper=pd.Timestamp(f"{YEAR}-12-31"))
+    n = ((e - s).dt.days + 1).clip(lower=0)
+    rep = ev.loc[ev.index.repeat(n), [id_col]].copy()
+    offs = np.concatenate([np.arange(k) for k in n]) if len(n) else np.array([], int)
+    rep["date"] = np.repeat(s.to_numpy(), n) + pd.to_timedelta(offs, unit="D")
+    return rep
+
+
+def find_blocks(daily):
+    rows = []
+    for fips, g in daily.groupby("parish_fips"):
+        if (g.source == "none").all():          # no-data parishes (empty flood_day)
+            continue
+        fd = g.flood_day.fillna(False).astype(bool)
+        days = pd.to_datetime(g.loc[fd, "date"]).sort_values().tolist()
+        if not days:
+            continue
+        s = prev = days[0]
+        for d in days[1:] + [None]:
+            if d is not None and (d - prev).days <= GAP_DAYS + 1:
+                prev = d
+                continue
+            n = (prev - s).days + 1
+            if n >= LONG_DAYS:
+                w = g[(pd.to_datetime(g.date) >= s) & (pd.to_datetime(g.date) <= prev)]
+                rows.append({"parish_fips": fips, "parish_name": g.parish_name.iloc[0],
+                             "confidence": g.confidence.iloc[0], "source": g.source.iloc[0],
+                             "start": s, "end": prev, "length_days": n,
+                             "flood_days": int(w.flood_day.fillna(False).astype(bool).sum()),
+                             "n_parish_reaches": int(g.nwm_n_reaches.iloc[0])})
+            if d is not None:
+                s = prev = d
+    return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------
+# CONTRIBUTORS
+# ----------------------------------------------------------------------------
+def parish_need(n_reaches):
+    """Reaches needed for a parish flood day (same rule as step 7)."""
+    return max(MIN_REACHES, int(np.ceil(MIN_FRAC * n_reaches)))
+
+
+def nwm_contributors(block, ev, reaches):
+    e = ev[ev.parish_fips == block.parish_fips]
+    if e.empty:
+        return pd.DataFrame(), {"verdict": "no NWM events", "n_contributors": 0}
+    days = expand_days(e.assign(fid=e.feature_id), "fid")
+    days = days[(days.date >= block.start) & (days.date <= block.end)]
+    if days.empty:
+        return pd.DataFrame(), {"verdict": "no NWM events", "n_contributors": 0}
+    rd = days.groupby("fid").date.nunique().rename("days_flooding")
+    longest = e.groupby("feature_id").duration_above_h.max().div(24).rename("longest_event_days")
+    c = (rd.to_frame().join(longest).reset_index().rename(columns={"fid": "feature_id"})
+         .merge(reaches, on="feature_id", how="left")
+         .sort_values("days_flooding", ascending=False))
+
+    # suspects: reaches that are 'always on' in the block, or coastal
+    c["stuck"] = (c.longest_event_days >= LONG_DAYS) | (c.days_flooding >= STUCK_FRAC * block.length_days)
+    c["coastal"] = (c.elevation < COASTAL_ELEV_M) if "elevation" in c else False
+    suspects = set(c.loc[c.stuck | c.coastal, "feature_id"])
+
+    need = parish_need(block.n_parish_reaches)
+    per_day = days.groupby("date").fid.nunique()
+    per_day_clean = days[~days.fid.isin(suspects)].groupby("date").fid.nunique()
+    fd_all = int((per_day >= need).sum())
+    fd_clean = int((per_day_clean.reindex(per_day.index, fill_value=0) >= need).sum())
+    lost = 1 - fd_clean / fd_all if fd_all else 0.0
+    stats = {"n_contributors": len(c), "n_suspects": len(suspects),
+             "median_reaches_per_day": float(per_day.median()),
+             "flood_days_in_block": fd_all, "flood_days_without_suspects": fd_clean,
+             "share_lost_without_suspects": round(lost, 2),
+             "max_event_days": float(c.longest_event_days.max())}
+    if lost >= LOST_SHARE:
+        kind = "coastal" if c.loc[c.feature_id.isin(suspects), "coastal"].mean() > 0.5 else "stuck"
+        verdict = f"{kind} reaches (likely artifact)"
+    elif stats["median_reaches_per_day"] >= max(10, 0.05 * block.n_parish_reaches):
+        verdict = "widespread (likely real)"
+    else:
+        verdict = "mixed - check hydrographs"
+    stats["verdict"] = verdict
+    c["suspect"] = c.feature_id.isin(suspects)
+    return c, stats
+
+
+def usgs_contributors(block, ev, sites):
+    if ev.empty:
+        return pd.DataFrame(), {"verdict": "no USGS events", "n_contributors": 0}
+    e = ev[ev.parish_fips == block.parish_fips].copy()
+    e["gid"] = e.monitoring_location_id + "_" + e.parameter_code
+    days = expand_days(e, "gid")
+    days = days[(days.date >= block.start) & (days.date <= block.end)]
+    if days.empty:
+        return pd.DataFrame(), {"verdict": "no USGS events", "n_contributors": 0}
+    rd = days.groupby("gid").date.nunique().rename("days_flooding")
+    longest = e.groupby("gid").duration_above_h.max().div(24).rename("longest_event_days")
+    c = rd.to_frame().join(longest).reset_index()
+    c[["monitoring_location_id", "parameter_code"]] = c.gid.str.rsplit("_", n=1, expand=True)
+    c = c.merge(sites, on="monitoring_location_id", how="left").sort_values(
+        "days_flooding", ascending=False)
+    c["drainage_area"] = pd.to_numeric(c.drainage_area, errors="coerce")
+    name = c.monitoring_location_name.fillna("")
+    c["regulated_or_tidal"] = (name.str.contains(REGULATED_RE)
+                               | c.site_type_code.isin(["ES", "ST-TS", "ST-CA", "ST-DCH"]))
+    c["big_river"] = name.str.contains(BIG_RIVER_RE) | (c.drainage_area > BIG_RIVER_SQMI)
+    c["suspect"] = c.regulated_or_tidal | c.big_river
+
+    fd_all = days.date.nunique()
+    fd_clean = days[~days.gid.isin(c.loc[c.suspect, "gid"])].date.nunique()
+    lost = 1 - fd_clean / fd_all if fd_all else 0.0
+    if lost >= LOST_SHARE:
+        verdict = ("big-river backwater (real, but not local flooding)"
+                   if c.loc[c.suspect, "big_river"].any() else "regulated/tidal gauges (likely artifact)")
+    else:
+        verdict = "check hydrographs"
+    stats = {"n_contributors": len(c), "n_suspects": int(c.suspect.sum()),
+             "flood_days_in_block": fd_all, "flood_days_without_suspects": fd_clean,
+             "share_lost_without_suspects": round(lost, 2),
+             "max_event_days": float(c.longest_event_days.max()), "verdict": verdict}
+    return c, stats
+
+
+# ----------------------------------------------------------------------------
+# FIGURE
+# ----------------------------------------------------------------------------
+def block_figure(block, c, shapes, nwm_ds, thr_map):
+    fig = plt.figure(figsize=(15, 6))
+    gs = fig.add_gridspec(N_HYDRO, 2, width_ratios=[1, 1.6])
+    ax = fig.add_subplot(gs[:, 0])
+    for ring in shapes.get(block.parish_fips, []):
+        ax.add_patch(Polygon(ring, closed=True, fc="#f4f4f4", ec="k", lw=0.8))
+    if len(c) and "lon" in c:
+        sc = ax.scatter(c.lon, c.lat, c=c.days_flooding, cmap="Reds", s=14, edgecolor="k", lw=0.2)
+        fig.colorbar(sc, ax=ax, shrink=0.6, label="days flooding in block")
+        top = c.head(N_HYDRO)
+        for k, (_, r) in enumerate(top.iterrows(), 1):
+            ax.annotate(str(k), (r.lon, r.lat), fontsize=10, fontweight="bold", color="navy")
+    rings = shapes.get(block.parish_fips, [])
+    if rings:
+        allp = np.vstack(rings)
+        ax.set_xlim(allp[:, 0].min() - 0.05, allp[:, 0].max() + 0.05)
+        ax.set_ylim(allp[:, 1].min() - 0.05, allp[:, 1].max() + 0.05)
+    ax.set_aspect(1.15)
+    ax.set_title(f"{block.parish_name}: {block.start:%d %b} - {block.end:%d %b} "
+                 f"({block.length_days} d)\n{block.verdict}", fontsize=10)
+
+    t0, t1 = block.start - pd.Timedelta(days=20), block.end + pd.Timedelta(days=20)
+    for k, (_, r) in enumerate(c.head(N_HYDRO).iterrows()):
+        axh = fig.add_subplot(gs[k, 1])
+        s, thr, lab = None, np.nan, ""
+        if "feature_id" in r and pd.notna(r.get("feature_id")) and nwm_ds is not None:
+            try:
+                s = nwm_ds["streamflow"].sel(feature_id=int(r.feature_id)).to_series()
+                s.index = pd.to_datetime(s.index)
+                thr = thr_map.get(int(r.feature_id), np.nan)
+                lab = (f"{k + 1}. NWM reach {int(r.feature_id)} (order {r.get('order', '?')}, "
+                       f"elev {r.get('elevation', np.nan):.1f} m) m3/s")
+            except Exception:
+                s = None
+        elif "monitoring_location_id" in r:
+            f = next(iter((USGS_DIR / "continuous").glob(
+                f"{r.monitoring_location_id}_{r.parameter_code}.*")), None)
+            try:
+                d = (pd.read_parquet(f) if f.suffix == ".parquet" else pd.read_csv(f)) \
+                    if f is not None else None
+            except Exception:
+                d = None
+            if d is not None:
+                d["time"] = pd.to_datetime(d["time"], utc=True).dt.tz_localize(None)
+                s = d.set_index("time")["value"].astype(float).resample("1h").mean()
+                if r.parameter_code == "00060":
+                    s = s * 0.0283168
+                thr = thr_map.get(r.gid, np.nan)
+                unit = "m3/s" if r.parameter_code == "00060" else "ft"
+                lab = f"{k + 1}. {r.monitoring_location_name} ({unit})"
+        if s is not None:
+            s = s[(s.index >= t0) & (s.index <= t1)]
+            axh.plot(s.index, s.values, lw=0.8, color="k")
+            if np.isfinite(thr):
+                axh.axhline(thr, color="#d62728", ls="--", lw=1, label="threshold")
+        axh.axvspan(block.start, block.end + pd.Timedelta(days=1), color="#ffcccc", alpha=0.4)
+        axh.set_title(lab, fontsize=8, loc="left")
+        axh.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+        axh.tick_params(labelsize=7)
+    fig.tight_layout()
+    fig.savefig(FIG_DIR / f"diag_{block.parish_name.replace(' ', '_').replace('.', '')}"
+                          f"_{block.start:%m%d}.png", dpi=140)
+    plt.close(fig)
+
+
+# ----------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project-dir", default=str(PROJECT_DIR))
+    args = ap.parse_args()
+    set_paths(Path(args.project_dir))
+
+    daily = pd.read_csv(FINAL_DIR / "parish_daily_2018.csv",
+                        dtype={"parish_fips": str, "flood_day": str}, parse_dates=["date"])
+    # flood_day is empty for 'no reliable data' parishes -> treat as not flooded here
+    daily["flood_day"] = daily["flood_day"].str.lower().eq("true")
+    daily = daily[daily["source"] != "none"]
+    blocks = find_blocks(daily)
+    if blocks.empty:
+        print(f"No flood blocks of {LONG_DAYS}+ days found.")
+        return
+    shapes = load_parishes()
+
+    # NWM inputs (same reach filter as step 7)
+    flags = pd.read_csv(EVAL_DIR / "reach_flags_2018.csv", dtype={"parish_fips": str})
+    use = flags[flags.use_reach & (INCLUDE_BIG_RIVERS | ~flags.big_river)]
+    ev_nwm = pd.read_parquet(EV_DIR / "events_nwm_2018.parquet")
+    ev_nwm["parish_fips"] = ev_nwm.parish_fips.astype(str)
+    ev_nwm = ev_nwm[ev_nwm.feature_id.isin(use.feature_id)]
+    reaches = pd.read_csv(NWM_DIR / "reaches_LA.csv") if (NWM_DIR / "reaches_LA.csv").exists() \
+        else flags[["feature_id", "lat", "lon"]]
+    keep = [c for c in ("feature_id", "lat", "lon", "order", "elevation", "gage_id") if c in reaches]
+    reaches = reaches[keep]
+    thr_map = dict(zip(flags.feature_id, flags.q2_cms))
+
+    # USGS inputs
+    p = EV_DIR / "events_usgs_2018.parquet"
+    ev_usgs = pd.read_parquet(p) if p.exists() else pd.DataFrame()
+    if len(ev_usgs):
+        ev_usgs["parish_fips"] = ev_usgs.parish_fips.astype(str)
+        thr_map.update(dict(zip(ev_usgs.monitoring_location_id + "_" + ev_usgs.parameter_code,
+                                ev_usgs.threshold)))
+    sites = pd.read_csv(USGS_DIR / "sites_LA.csv", dtype=str)[
+        ["monitoring_location_id", "monitoring_location_name", "site_type_code",
+         "drainage_area", "lat", "lon"]]
+    sites[["lat", "lon"]] = sites[["lat", "lon"]].astype(float)
+
+    zarr = NWM_DIR / "nwm_LA_hourly_2018.zarr"
+    nwm_ds = None
+    if zarr.exists():
+        import xarray as xr
+        nwm_ds = xr.open_zarr(zarr)
+
+    out_rows, contrib_rows, excl = [], [], []
+    for _, b in blocks.iterrows():
+        if b.source == "NWM":
+            c, st = nwm_contributors(b, ev_nwm, reaches)
+        else:
+            c, st = usgs_contributors(b, ev_usgs, sites)
+        if len(c) and st.get("share_lost_without_suspects", 0) >= LOST_SHARE:
+            for _, r in c[c.suspect].iterrows():
+                if b.source == "NWM":
+                    excl.append({"type": "nwm_reach", "id": int(r.feature_id),
+                                 "parish_fips": b.parish_fips,
+                                 "reason": "coastal" if r.coastal else "stuck",
+                                 "block": f"{b.start:%Y-%m-%d}/{b.end:%Y-%m-%d}"})
+                else:
+                    excl.append({"type": "usgs_gauge", "id": r.gid, "parish_fips": b.parish_fips,
+                                 "reason": "big-river backwater" if r.big_river else "regulated/tidal",
+                                 "block": f"{b.start:%Y-%m-%d}/{b.end:%Y-%m-%d}"})
+        b = b.copy()
+        for k, v in st.items():
+            b[k] = v
+        out_rows.append(b)
+        if len(c):
+            contrib_rows.append(c.head(50).assign(parish_fips=b.parish_fips,
+                                                  block_start=b.start.date(), source=b.source))
+        block_figure(b, c, shapes, nwm_ds, thr_map)
+
+    res = pd.DataFrame(out_rows)
+    res.to_csv(OUT_DIR / "long_blocks_2018.csv", index=False)
+    if contrib_rows:
+        pd.concat(contrib_rows, ignore_index=True).to_csv(
+            OUT_DIR / "long_block_contributors.csv", index=False)
+    ex = pd.DataFrame(excl, columns=["type", "id", "parish_fips", "reason", "block"]).drop_duplicates("id")
+    ex.to_csv(OUT_DIR / "suggested_exclusions.csv", index=False)
+
+    print(f"{len(res)} flood blocks of {LONG_DAYS}+ days:\n")
+    cols = ["parish_name", "confidence", "source", "start", "end", "length_days",
+            "n_contributors", "n_suspects", "share_lost_without_suspects", "verdict"]
+    r = res[cols].copy()
+    r["start"], r["end"] = r.start.dt.strftime("%d %b"), r.end.dt.strftime("%d %b")
+    print(r.to_string(index=False))
+    print(f"\nSuggested exclusions: {len(ex)} "
+          f"({(ex.type == 'nwm_reach').sum()} NWM reaches, {(ex.type == 'usgs_gauge').sum()} USGS gauges)"
+          f" -> review {OUT_DIR / 'suggested_exclusions.csv'}")
+    print(f"Figures: {FIG_DIR}")
+
+
+if __name__ == "__main__":
+    main()
