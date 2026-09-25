@@ -1,0 +1,433 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Sep 25 15:22:11 2026
+
+@author: mh01
+"""
+
+"""
+STEP 10 - Enrich the ZCTA flood events: storm ID, event type, return period,
+          observed / modeled flag
+===========================================================================
+Adds to every ZCTA event of step 9:
+
+  storm_id            one ID per storm: ZCTA events in neighbouring ZCTAs whose
+                      peaks are <= STORM_PEAK_GAP days apart, or that match the
+                      same NWS storm episode, get the same storm_id
+  event_type          tropical cyclone / heavy rainfall - flash flooding /
+                      heavy rainfall - river flooding / heavy rainfall - not reported
+  event_type_basis    what the label is based on (HURDAT2, Storm Events, streamflow only)
+  coastal_flood_reported, big_river_flooding  extra flags (not in our magnitudes)
+  return_period_max   largest return period (years) of the reach peaks in the
+                      event (Gumbel fit to the 1980-2022 NWM annual maxima)
+  magnitude_modeled   NWM peak / 2-yr flow  (always present)
+  magnitude_observed  USGS gauge peak / 2-yr flow, if a usable gauge in the ZCTA
+                      flooded during the event
+  magnitude_best      observed if available, else modeled
+  magnitude_source    "observed (USGS)" / "modeled (NWM)" / "imputed" (not used yet)
+
+Inputs : data/zcta/zcta_events_2018.csv, zcta_reaches.csv, zcta_boundaries_LA.gpkg (step 9)
+         data/events/events_nwm_2018.parquet, events_usgs_2018.parquet (step 5)
+         data/nwm/reach_thresholds_LA.csv (step 3)
+         data/validation/storm_events_LA_2018.csv (step 8)
+         data/final/parish_daily_2018.csv (step 7)
+         HURDAT2 Atlantic hurricane tracks (downloaded automatically from NHC)
+Outputs: data/zcta/zcta_events_2018_enriched.csv
+         data/zcta/storms_2018.csv            one row per storm (incl. the list of ZCTAs)
+         data/zcta/figures/fig14_storms_2018.png
+Usage  : python 10_enrich_zcta_events.py
+"""
+
+import argparse
+import re
+from pathlib import Path
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+
+# ----------------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------------
+PROJECT_DIR = Path(r"D:\Tufts\Wishlist\Sepideh_2")
+YEAR = 2018
+STORM_PEAK_GAP = 2        # neighbouring ZCTA events with peaks <= 2 days apart = same storm
+TOL_DAYS = 1              # date tolerance when matching reports / gauges
+TC_RADIUS_KM = 300        # a tropical cyclone within 300 km during the storm -> tropical
+TC_LEAD_DAYS = 3          # ... from 3 days before the storm start to its end
+RP_CAP = 100              # return periods above this are reported as 100 (extrapolation)
+NHC_DATA = "https://www.nhc.noaa.gov/data/"
+REGULATED_RE = re.compile(r"canal|outlet|pump|flood ?gate|cutoff|giww|lock|spillway|"
+                          r"control|diversion|channel|pass\b", re.I)
+BIG_RIVER_RE = re.compile(r"mississippi|atchafalaya|morgan city|wax lake", re.I)
+TYPE_COLOR = {"tropical cyclone": "#9467bd",
+              "heavy rainfall - flash flooding": "#d62728",
+              "heavy rainfall - river flooding": "#1f77b4",
+              "heavy rainfall - not reported": "#7f7f7f"}
+
+
+def set_paths(project_dir):
+    global D, ZDIR, FIG
+    D = project_dir / "data"
+    ZDIR = D / "zcta"
+    FIG = ZDIR / "figures"
+    FIG.mkdir(parents=True, exist_ok=True)
+
+
+def to_day(x):
+    return pd.to_datetime(pd.Series(x).astype(str).str[:10], errors="coerce").to_numpy()
+
+
+# ----------------------------------------------------------------------------
+# UNION-FIND (groups events into storms)
+# ----------------------------------------------------------------------------
+class UF:
+    def __init__(self, n):
+        self.p = list(range(n))
+
+    def find(self, i):
+        while self.p[i] != i:
+            self.p[i] = self.p[self.p[i]]
+            i = self.p[i]
+        return i
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.p[rb] = ra
+
+
+# ----------------------------------------------------------------------------
+# 1. RETURN PERIOD OF EVERY REACH PEAK
+# ----------------------------------------------------------------------------
+def reach_return_periods(zr):
+    ev = pd.read_parquet(D / "events" / "events_nwm_2018.parquet")
+    ev = ev.merge(zr, on="feature_id", how="inner")
+    th = pd.read_csv(D / "nwm" / "reach_thresholds_LA.csv")[
+        ["feature_id", "qmax_mean_cms", "qmax_std_cms"]]
+    ev = ev.merge(th, on="feature_id", how="left")
+    alpha = np.sqrt(6) * ev.qmax_std_cms / np.pi
+    u = ev.qmax_mean_cms - 0.5772 * alpha
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        F = np.exp(-np.exp(-(ev.peak - u) / alpha))          # non-exceedance probability
+        T = 1 / (1 - F)
+    ev["return_period"] = np.where(alpha > 0, np.clip(T, 1, RP_CAP), np.nan)
+    ev["peak_date"] = to_day(ev.peak_date_local)
+    ev["peak_ratio_c"] = ev.peak_ratio.clip(upper=10)
+    return ev
+
+
+# ----------------------------------------------------------------------------
+# 2. OBSERVED MAGNITUDE AT USGS GAUGES
+# ----------------------------------------------------------------------------
+def usgs_events_by_zcta(z):
+    p = D / "events" / "events_usgs_2018.parquet"
+    if not p.exists():
+        return pd.DataFrame()
+    ev = pd.read_parquet(p)
+    ev["gid"] = ev.monitoring_location_id + "_" + ev.parameter_code
+    sites = pd.read_csv(D / "usgs" / "sites_LA.csv", dtype=str)
+    sites[["lat", "lon"]] = sites[["lat", "lon"]].astype(float)
+    # same gauge rules as step 7: drop reviewed exclusions, regulated and big-river gauges
+    drop = set()
+    ex_path = D / "diagnostics" / "reviewed_exclusions.csv"
+    if ex_path.exists():
+        ex = pd.read_csv(ex_path, dtype=str)
+        drop = set(ex.loc[ex.type == "usgs_gauge", "id"])
+    name = ev.monitoring_location_id.map(sites.set_index("monitoring_location_id")
+                                         .monitoring_location_name).fillna("")
+    stype = ev.monitoring_location_id.map(sites.set_index("monitoring_location_id").site_type_code)
+    bad = (ev.gid.isin(drop) | name.str.contains(REGULATED_RE) | name.str.contains(BIG_RIVER_RE)
+           | stype.isin(["ES", "ST-TS", "ST-CA", "ST-DCH"]))
+    ev = ev[~bad].merge(sites[["monitoring_location_id", "lat", "lon"]], on="monitoring_location_id")
+    pts = gpd.GeoDataFrame(ev, geometry=gpd.points_from_xy(ev.lon, ev.lat), crs=4326)
+    ev = pd.DataFrame(gpd.sjoin(pts, z[["zcta", "geometry"]], predicate="within")
+                      .drop(columns=["geometry", "index_right"]))
+    ev["start"] = to_day(ev.start_date_local)
+    ev["end"] = to_day(ev.end_date_local)
+    return ev
+
+
+# ----------------------------------------------------------------------------
+# 3. STORM EVENTS REPORTS AND HURRICANE TRACKS
+# ----------------------------------------------------------------------------
+def load_reports(z):
+    p = D / "validation" / "storm_events_LA_2018.csv"
+    if not p.exists():
+        print("  ! storm_events_LA_2018.csv not found (run step 8) - no report linking")
+        return pd.DataFrame()
+    se = pd.read_csv(p, dtype=str)
+    se["begin"] = to_day(se["begin"])
+    se["end"] = to_day(se["end"])
+    se["lat"] = pd.to_numeric(se.get("BEGIN_LAT"), errors="coerce")
+    se["lon"] = pd.to_numeric(se.get("BEGIN_LON"), errors="coerce")
+    se["zcta"] = None
+    has = se.lat.notna() & se.lon.notna()
+    if has.any():
+        pts = gpd.GeoDataFrame(se[has], geometry=gpd.points_from_xy(se.lon[has], se.lat[has]), crs=4326)
+        j = gpd.sjoin(pts, z[["zcta", "geometry"]], predicate="within")
+        se.loc[j.index, "zcta"] = j["zcta_right"] if "zcta_right" in j else j["zcta"]
+    return se
+
+
+def load_hurdat(user_file=None):
+    cache = D / "hurdat"
+    cache.mkdir(exist_ok=True)
+    if user_file:
+        path = Path(user_file)
+    else:
+        found = sorted(cache.glob("hurdat2-1851-*.txt"))
+        if found:
+            path = found[-1]
+        else:
+            try:
+                html = requests.get(NHC_DATA, timeout=60).text
+                names = sorted(set(re.findall(r"hurdat2-1851-\d{4}-\d{6}\.txt", html)))
+                if not names:
+                    raise RuntimeError("no HURDAT2 link found")
+                print(f"Downloading {names[-1]} ...")
+                r = requests.get(NHC_DATA + "hurdat/" + names[-1], timeout=300)
+                r.raise_for_status()
+                path = cache / names[-1]
+                path.write_bytes(r.content)
+            except Exception as exc:
+                print(f"  ! HURDAT2 not available ({str(exc)[:80]}); tropical labels come "
+                      "only from Storm Events flood causes (use --hurdat-file)")
+                return pd.DataFrame()
+    rows, name = [], None
+    for line in path.read_text().splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) >= 3 and parts[0][:2] in ("AL",) and len(parts) < 8:
+            name = f"{parts[1].title()} ({parts[0]})"
+            continue
+        if len(parts) > 6 and parts[0][:4] == str(YEAR):
+            lat = float(parts[4][:-1]) * (1 if parts[4][-1] == "N" else -1)
+            lon = float(parts[5][:-1]) * (-1 if parts[5][-1] == "W" else 1)
+            rows.append({"storm": name, "time": pd.to_datetime(parts[0] + parts[1], format="%Y%m%d%H%M"),
+                         "lat": lat, "lon": lon, "status": parts[3]})
+    return pd.DataFrame(rows)
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(np.radians, (lat1, lon1, lat2, lon2))
+    a = (np.sin((lat2 - lat1) / 2) ** 2
+         + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2)
+    return 6371 * 2 * np.arcsin(np.sqrt(a))
+
+
+# ----------------------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project-dir", default=str(PROJECT_DIR))
+    ap.add_argument("--hurdat-file", default=None)
+    args = ap.parse_args()
+    set_paths(Path(args.project_dir))
+
+    z = gpd.read_file(ZDIR / "zcta_boundaries_LA.gpkg")
+    z["zcta"] = z["zcta"].astype(str)
+    zr = pd.read_csv(ZDIR / "zcta_reaches.csv", dtype={"zcta": str})
+    ze = pd.read_csv(ZDIR / "zcta_events_2018.csv", dtype={"zcta": str})
+    ze["start"], ze["end"], ze["peak"] = to_day(ze.start_date), to_day(ze.end_date), to_day(ze.peak_day)
+    ze = ze.merge(z[["zcta", "main_parish_fips"]], on="zcta", how="left")
+    cent = z.set_index("zcta").geometry.to_crs(3857).centroid.to_crs(4326)
+    ze["lat"], ze["lon"] = ze.zcta.map(cent.y), ze.zcta.map(cent.x)
+    print(f"{len(ze):,} ZCTA events to enrich")
+
+    nb = gpd.sjoin(z[["zcta", "geometry"]], z[["zcta", "geometry"]], predicate="touches")
+    neigh = nb.groupby("zcta_left").zcta_right.apply(set).to_dict()
+
+    # ---- return period and modeled magnitude ---------------------------------
+    rev = reach_return_periods(zr)
+    rp_max, rp_med, mod = [], [], []
+    grp = {k: g for k, g in rev.groupby("zcta")}
+    for zc, s, e in zip(ze.zcta, ze.start, ze.end):
+        g = grp.get(zc)
+        sub = g[(g.peak_date >= s) & (g.peak_date <= e)] if g is not None else None
+        ok = sub is not None and len(sub)
+        rp_max.append(sub.return_period.max() if ok else np.nan)
+        rp_med.append(sub.return_period.median() if ok else np.nan)
+        mod.append(sub.peak_ratio_c.max() if ok else np.nan)
+    ze["return_period_max"] = rp_max
+    ze["return_period_median"] = rp_med
+    ze["return_period_class"] = pd.cut(ze.return_period_max, [0, 2, 5, 10, 25, 50, RP_CAP + 1],
+                                       labels=["<2 yr", "2-5 yr", "5-10 yr", "10-25 yr",
+                                               "25-50 yr", ">=50 yr"], right=False)
+    ze["magnitude_modeled"] = mod
+
+    # ---- observed magnitude (USGS) --------------------------------------------
+    ug = usgs_events_by_zcta(z)
+    tol = pd.Timedelta(days=TOL_DAYS)
+    obs, gids, stage = [], [], []
+    ugrp = {k: g for k, g in ug.groupby("zcta")} if len(ug) else {}
+    for zc, s, e in zip(ze.zcta, ze.start, ze.end):
+        g = ugrp.get(zc)
+        if g is None:
+            obs.append(np.nan); gids.append(""); stage.append(np.nan)
+            continue
+        m = g[(g.start <= e + tol) & (g.end >= s - tol)]
+        q = m[m.parameter_code == "00060"]
+        h = m[m.parameter_code == "00065"]
+        obs.append(q.peak_ratio.clip(upper=10).max() if len(q) else np.nan)
+        stage.append(h.peak_excess.max() if len(h) else np.nan)
+        gids.append(";".join(sorted(set(m.monitoring_location_id))))
+    ze["magnitude_observed"] = obs
+    ze["observed_stage_above_flood_ft"] = stage
+    ze["usgs_gauges"] = gids
+    has_obs = ze.magnitude_observed.notna()
+    ze["magnitude_best"] = np.where(has_obs, ze.magnitude_observed, ze.magnitude_modeled)
+    ze["magnitude_source"] = np.where(has_obs, "observed (USGS)",
+                                      np.where(ze.magnitude_modeled.notna(), "modeled (NWM)", "none"))
+
+    # ---- link NWS reports -------------------------------------------------------
+    se = load_reports(z)
+    flood_rep = se[se.EVENT_TYPE.isin(["Flash Flood", "Flood"])] if len(se) else se
+    coast_rep = se[se.EVENT_TYPE.isin(["Coastal Flood", "Storm Surge/Tide"])] if len(se) else se
+    ep, rtype, cause = [], [], []
+    for zc, par, s, e in zip(ze.zcta, ze.main_parish_fips, ze.start, ze.end):
+        if not len(flood_rep):
+            ep.append(""); rtype.append(""); cause.append("")
+            continue
+        near = {zc} | neigh.get(zc, set())
+        t = flood_rep[(flood_rep.begin <= e + tol) & (flood_rep.end >= s - tol)]
+        m = t[(t.zcta.isin(near)) | (t.zcta.isna() & (t.parish_fips == par))]
+        ep.append(";".join(sorted(set(m.EPISODE_ID.dropna()))))
+        rtype.append(";".join(sorted(set(m.EVENT_TYPE.dropna()))))
+        cause.append(";".join(sorted(set(m.get("FLOOD_CAUSE", pd.Series(dtype=str)).dropna()))))
+    ze["nws_episode_ids"], ze["nws_report_types"], ze["nws_flood_cause"] = ep, rtype, cause
+
+    # ---- storm IDs --------------------------------------------------------------
+    n = len(ze)
+    uf = UF(n)
+    idx_by_z = {k: list(g.index) for k, g in ze.groupby("zcta")}
+    gap = pd.Timedelta(days=STORM_PEAK_GAP)
+    for i, (zc, pk) in enumerate(zip(ze.zcta, ze.peak)):
+        for nz in neigh.get(zc, ()):
+            for j in idx_by_z.get(nz, ()):
+                if j > i and abs(ze.peak[j] - pk) <= gap:
+                    uf.union(i, j)
+    by_ep = {}
+    for i, eps in enumerate(ze.nws_episode_ids):
+        for e_id in filter(None, eps.split(";")):
+            by_ep.setdefault(e_id, []).append(i)
+    for members in by_ep.values():
+        for j in members[1:]:
+            uf.union(members[0], j)
+    roots = [uf.find(i) for i in range(n)]
+    order = (pd.DataFrame({"root": roots, "peak": ze.peak}).groupby("root").peak.min()
+             .sort_values().index)
+    sid = {r: f"LA{YEAR}_S{k + 1:03d}" for k, r in enumerate(order)}
+    ze["storm_id"] = [sid[r] for r in roots]
+
+    # ---- storm table + event type ----------------------------------------------------
+    tracks = load_hurdat(args.hurdat_file)
+    pdaily = pd.read_csv(D / "final" / "parish_daily_2018.csv", dtype={"parish_fips": str},
+                         usecols=["parish_fips", "date", "big_river_flood_day"])
+    pdaily["date"] = to_day(pdaily.date)
+    big = set(map(tuple, pdaily.loc[pdaily.big_river_flood_day.astype(bool),
+                                    ["parish_fips", "date"]].to_numpy()))
+    rows = []
+    for s_id, g in ze.groupby("storm_id"):
+        s, e = g.start.min(), g.end.max()
+        pars = set(g.main_parish_fips.dropna())
+        tc = ""
+        if len(tracks):
+            t = tracks[(tracks.time >= s - pd.Timedelta(days=TC_LEAD_DAYS)) &
+                       (tracks.time <= e + pd.Timedelta(days=1))]
+            if len(t):
+                d = haversine_km(g.lat.mean(), g.lon.mean(), t.lat.to_numpy(), t.lon.to_numpy())
+                close = t[d <= TC_RADIUS_KM]
+                tc = ";".join(sorted(set(close.storm)))
+        causes = ";".join(sorted(set(";".join(g.nws_flood_cause).split(";")) - {""}))
+        types = set(";".join(g.nws_report_types).split(";")) - {""}
+        if tc or "tropical" in causes.lower():
+            etype, basis = "tropical cyclone", "HURDAT2 track" if tc else "Storm Events flood cause"
+        elif "Flash Flood" in types:
+            etype, basis = "heavy rainfall - flash flooding", "Storm Events report type"
+        elif "Flood" in types:
+            etype, basis = "heavy rainfall - river flooding", "Storm Events report type"
+        else:
+            etype, basis = "heavy rainfall - not reported", "streamflow only (no NWS report)"
+        coastal = bool(len(coast_rep)) and bool(
+            ((coast_rep.parish_fips.isin(pars)) & (coast_rep.begin <= e + tol) &
+             (coast_rep.end >= s - tol)).any())
+        bigr = any((p, dd) in big for p in pars for dd in pd.date_range(s, e))
+        rows.append({
+            "storm_id": s_id, "start_date": pd.Timestamp(s).date(), "end_date": pd.Timestamp(e).date(),
+            "peak_day": pd.Timestamp(g.peak.min() if g.peak.notna().any() else s).date(),
+            "length_days": (e - s).days + 1, "n_zctas": g.zcta.nunique(),
+            "zctas": ";".join(sorted(g.zcta.astype(str).unique())),
+            "n_parishes": len(pars), "parishes": ";".join(sorted(pars)),
+            "event_type": etype, "event_type_basis": basis, "tropical_cyclone": tc,
+            "nws_flood_cause": causes, "nws_episode_ids": ";".join(sorted(
+                set(";".join(g.nws_episode_ids).split(";")) - {""})),
+            "coastal_flood_reported": coastal, "big_river_flooding": bigr,
+            "magnitude_max": g.magnitude_best.max(),
+            "return_period_max": g.return_period_max.max(),
+            "duration_median_rise_h": g.duration_median_rise_h.median(),
+            "severity_max_norm": g.severity_max_norm.max(),
+            "share_observed": (g.magnitude_source == "observed (USGS)").mean()})
+    st = pd.DataFrame(rows).sort_values("start_date")
+    st.to_csv(ZDIR / "storms_2018.csv", index=False)
+    ze = ze.merge(st[["storm_id", "event_type", "event_type_basis", "tropical_cyclone",
+                      "coastal_flood_reported", "big_river_flooding"]], on="storm_id", how="left")
+
+    lead = ["storm_id", "event_id", "zcta", "main_parish_name", "start_date", "end_date",
+            "peak_day", "length_days", "event_type", "event_type_basis",
+            "magnitude_best", "magnitude_source", "magnitude_modeled", "magnitude_observed",
+            "return_period_max", "return_period_class", "duration_median_rise_h",
+            "severity_max_norm", "confidence"]
+    drop = ["start", "end", "peak", "lat", "lon"]
+    ze = ze[[c for c in lead if c in ze] + [c for c in ze.columns if c not in lead + drop]]
+    ze.to_csv(ZDIR / "zcta_events_2018_enriched.csv", index=False)
+
+    figure(st, ze, z)
+
+    # ---- summary ----------------------------------------------------------------
+    print(f"\nStorms: {len(st)}  (ZCTA events {len(ze):,} grouped into {len(st)} storms)")
+    big5 = st.sort_values("n_zctas", ascending=False).head(5)
+    print("Largest storms:")
+    print(big5[["storm_id", "start_date", "end_date", "n_zctas", "n_parishes", "event_type",
+                "return_period_max"]].to_string(index=False))
+    print("\nStorms by type:")
+    print(st.event_type.value_counts().to_string())
+    print("\nZCTA events by magnitude source:")
+    print(ze.magnitude_source.value_counts().to_string())
+    print("\nZCTA events by return-period class:")
+    print(ze.return_period_class.value_counts().sort_index().to_string())
+    print(f"\nOutputs in {ZDIR}")
+
+
+def figure(st, ze, z):
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5), gridspec_kw={"width_ratios": [1.3, 1]})
+    ax = axes[0]
+    for t, c in TYPE_COLOR.items():
+        s = st[st.event_type == t]
+        if len(s):
+            ax.scatter(pd.to_datetime(s.peak_day), s.n_zctas, s=10 + 60 * np.log10(s.return_period_max.fillna(1).clip(lower=1)),
+                       c=c, alpha=0.7, edgecolor="k", lw=0.3, label=f"{t} ({len(s)})")
+    ax.set_yscale("log")
+    ax.set(ylabel="ZCTAs affected (log)", title="A. 2018 storms (dot size = max return period)")
+    leg = ax.legend(fontsize=8, loc="upper left")
+    for h in leg.legend_handles:
+        h.set_sizes([40])
+    ax = axes[1]
+    rp = ze.groupby("zcta").return_period_max.max()
+    g = z.assign(rp=z.zcta.map(rp))
+    g[g.rp.isna()].plot(ax=ax, color="#eeeeee", lw=0)
+    if g.rp.notna().any():
+        g[g.rp.notna()].plot(ax=ax, column="rp", cmap="magma_r", lw=0, legend=True,
+                             vmin=1, vmax=min(RP_CAP, g.rp.quantile(0.95)),
+                             legend_kwds={"shrink": 0.6, "label": "years"})
+    ax.set_title("B. Largest return period of the year per ZCTA")
+    ax.set_axis_off()
+    fig.tight_layout()
+    fig.savefig(FIG / "fig14_storms_2018.png", dpi=160)
+    plt.close(fig)
+
+
+if __name__ == "__main__":
+    main()
