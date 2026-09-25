@@ -1,0 +1,467 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Sep 25 15:04:46 2026
+
+@author: mh01
+"""
+
+"""
+STEP 9 - Flood dataset at ZCTA (ZIP Code Tabulation Area) level, Louisiana 2018
+==============================================================================
+Re-groups the NWM reach events of step 5 by 2020 Census ZCTA instead of parish,
+using the same clean-up as step 7 (reach flags + reviewed exclusions).
+
+Outputs (data/zcta/)
+  zcta_daily_2018.csv     one row per ZCTA per day
+  zcta_events_2018.csv    one row per ZCTA flood event
+  zcta_annual_2018.csv    one row per ZCTA: frequency, magnitude, duration, severity
+  zcta_validation_2018.txt  flash-flood reports (with coordinates) vs ZCTA flood days
+  zcta_reaches.csv, zcta_boundaries_LA.gpkg  (used by step 10)
+  figures/fig12_zcta_maps_2018.png, fig13_zcta_reliability.png
+
+Rules (same definitions as the parish dataset)
+  flood day : >= max(Z_MIN_REACHES, Z_MIN_FRAC x reaches) NWM reaches above
+              their 2-yr flow on that local day
+  event     : flood days separated by <= 1 dry day
+  magnitude : event peak / 2-yr flow (capped at 10); duration: rise time (h);
+              severity: peak ratio / rise time
+  No reliable data (flood_day left empty) when
+    - the ZCTA has fewer than Z_MIN_REACHES_DATA usable reaches, or
+    - its main parish is "unverified" (Cameron, Plaquemines, St. Bernard)
+
+Confidence
+  inherited from the parish holding most of the ZCTA's land, then lowered one
+  level if more than half of the ZCTA is urban (pipes, canals and pumps are
+  not simulated by NWM). Every ZCTA also reports n_reaches, so values that rest
+  on few reaches are visible.
+
+Census files (downloaded automatically, cached in data/zcta/census/)
+  ZCTA boundaries   : cb_2020_us_zcta520_500k.zip          (~60 MB)
+  ZCTA -> county    : tab20_zcta520_county20_natl.txt       (land area per part)
+  Urban area -> ZCTA: tab20_ua20_zcta520_natl.txt           (optional, urban share)
+
+Requirements: pip install geopandas pandas pyarrow matplotlib requests
+Usage       : python 09_zcta_dataset.py
+"""
+
+import argparse
+import re
+from pathlib import Path
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+from matplotlib.patches import Patch
+
+# ----------------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------------
+PROJECT_DIR = Path(r"D:\Tufts\Wishlist\Sepideh_2")
+YEAR = 2018
+STATE_FIPS = "22"
+Z_MIN_REACHES = 2          # ZCTA flood day needs at least this many reaches ...
+Z_MIN_FRAC = 0.02          # ... and at least this share of the ZCTA's reaches
+Z_MIN_REACHES_DATA = 5     # fewer usable reaches than this -> no reliable data
+MERGE_DAYS = 1
+RATIO_CAP = 10
+LONG_EVENT_DAYS = 30
+URBAN_SHARE = 0.5
+INCLUDE_BIG_RIVERS = False
+TOL_DAYS = 1
+
+URLS = {
+    "zcta_shp": "https://www2.census.gov/geo/tiger/GENZ2020/shp/cb_2020_us_zcta520_500k.zip",
+    "zcta_county": ("https://www2.census.gov/geo/docs/maps-data/data/rel2020/zcta520/"
+                    "tab20_zcta520_county20_natl.txt"),
+    "ua_zcta": ("https://www2.census.gov/geo/docs/maps-data/data/rel2020/ua/"
+                "tab20_ua20_zcta520_natl.txt"),
+}
+DOWN = {"high": "medium", "medium": "low", "low": "low", "unverified": "unverified"}
+CONF_COLOR = {"high": "#2ca02c", "medium": "#ffbf00", "low": "#d62728",
+              "no data": "#bbbbbb"}
+
+
+def set_paths(project_dir):
+    global USGS_DIR, NWM_DIR, EV_DIR, EVAL_DIR, DIAG_DIR, VAL_DIR, OUT_DIR, CEN_DIR, FIG_DIR
+    d = project_dir / "data"
+    USGS_DIR, NWM_DIR, EV_DIR = d / "usgs", d / "nwm", d / "events"
+    EVAL_DIR, DIAG_DIR, VAL_DIR = d / "evaluation", d / "diagnostics", d / "validation"
+    OUT_DIR = d / "zcta"
+    CEN_DIR = OUT_DIR / "census"
+    FIG_DIR = OUT_DIR / "figures"
+    for p in (CEN_DIR, FIG_DIR):
+        p.mkdir(parents=True, exist_ok=True)
+
+
+def fetch(key, override=None):
+    """Return a local path for a Census file, downloading it once if needed."""
+    if override:
+        return Path(override)
+    path = CEN_DIR / URLS[key].rsplit("/", 1)[1]
+    if not path.exists():
+        print(f"Downloading {path.name} ...")
+        r = requests.get(URLS[key], timeout=900)
+        r.raise_for_status()
+        path.write_bytes(r.content)
+    return path
+
+
+# ----------------------------------------------------------------------------
+# 1. ZCTAs OF LOUISIANA
+# ----------------------------------------------------------------------------
+def load_zctas(args):
+    rel = pd.read_csv(fetch("zcta_county", args.rel_file), sep="|", dtype=str)
+    rel = rel.dropna(subset=["GEOID_ZCTA5_20"])
+    rel["land"] = pd.to_numeric(rel["AREALAND_PART"], errors="coerce").fillna(0)
+    la = rel[rel.GEOID_COUNTY_20.str.startswith(STATE_FIPS)]
+    zset = set(la.GEOID_ZCTA5_20)
+    # main parish = the Louisiana parish holding most of the ZCTA's land
+    main = (la.sort_values("land", ascending=False).drop_duplicates("GEOID_ZCTA5_20")
+            .set_index("GEOID_ZCTA5_20")[["GEOID_COUNTY_20", "land"]])
+    tot = rel[rel.GEOID_ZCTA5_20.isin(zset)].groupby("GEOID_ZCTA5_20").land.sum()
+    main["main_parish_share"] = main.land / tot.reindex(main.index).replace(0, np.nan)
+    main = main.rename(columns={"GEOID_COUNTY_20": "main_parish_fips"}).drop(columns="land")
+    n_par = la.groupby("GEOID_ZCTA5_20").GEOID_COUNTY_20.nunique().rename("n_parishes")
+
+    shp = fetch("zcta_shp", args.zcta_file)
+    z = gpd.read_file(f"zip://{shp}" if str(shp).endswith(".zip") else shp)
+    idcol = next(c for c in z.columns if c.upper().startswith(("ZCTA5CE", "GEOID")))
+    z = z.rename(columns={idcol: "zcta"})[["zcta", "geometry"]]
+    z = z[z.zcta.isin(zset)].to_crs(4326).reset_index(drop=True)
+    z = z.join(main, on="zcta").join(n_par, on="zcta")
+
+    # urban share (optional)
+    try:
+        ua = pd.read_csv(fetch("ua_zcta", args.ua_file), sep="|", dtype=str)
+        ua["land"] = pd.to_numeric(ua["AREALAND_PART"], errors="coerce").fillna(0)
+        ua = ua[ua.GEOID_ZCTA5_20.isin(zset) & ua.GEOID_UA_20.notna()]
+        urban_land = ua.groupby("GEOID_ZCTA5_20").land.sum()
+        z["urban_share"] = (z.zcta.map(urban_land).fillna(0) /
+                            z.zcta.map(tot).replace(0, np.nan)).clip(0, 1).fillna(0)
+    except Exception as exc:
+        print(f"  ! urban relationship file not available ({str(exc)[:80]}); "
+              "urban_share left empty, no urban downgrade")
+        z["urban_share"] = np.nan
+    print(f"  {len(z)} ZCTAs touch Louisiana")
+    return z
+
+
+# ----------------------------------------------------------------------------
+# 2. REACHES -> ZCTA
+# ----------------------------------------------------------------------------
+def load_reaches(z):
+    flags = pd.read_csv(EVAL_DIR / "reach_flags_2018.csv", dtype={"parish_fips": str})
+    excl = set()
+    p = DIAG_DIR / "reviewed_exclusions.csv"
+    if p.exists():
+        ex = pd.read_csv(p, dtype={"id": str})
+        ex["decision"] = ex.get("decision", "exclude")
+        excl = set(ex.loc[(ex.type == "nwm_reach") & (ex.decision == "exclude"), "id"]
+                   .astype(float).astype("int64"))
+    else:
+        print("  ! reviewed_exclusions.csv not found - no reach exclusions")
+    use = flags[flags.use_reach & (INCLUDE_BIG_RIVERS | ~flags.big_river)
+                & ~flags.feature_id.isin(excl)].copy()
+    pts = gpd.GeoDataFrame(use[["feature_id"]],
+                           geometry=gpd.points_from_xy(use.lon, use.lat), crs=4326)
+    j = gpd.sjoin(pts, z[["zcta", "geometry"]], how="inner", predicate="within")
+    r = j[["feature_id", "zcta"]].drop_duplicates("feature_id")
+    print(f"  {len(r):,} of {len(use):,} usable reaches fall inside a Louisiana ZCTA")
+    return r
+
+
+# ----------------------------------------------------------------------------
+# helpers
+# ----------------------------------------------------------------------------
+def expand_days(ev, id_col, key="zcta"):
+    ev = ev.reset_index(drop=True)
+    s = pd.to_datetime(ev["start_date_local"].astype(str).str[:10]).clip(
+        lower=pd.Timestamp(f"{YEAR}-01-01"))
+    e = pd.to_datetime(ev["end_date_local"].astype(str).str[:10]).clip(
+        upper=pd.Timestamp(f"{YEAR}-12-31"))
+    n = ((e - s).dt.days + 1).clip(lower=0)
+    rep = ev.loc[ev.index.repeat(n), [id_col, key]].copy()
+    offs = np.concatenate([np.arange(k) for k in n]) if len(n) else np.array([], int)
+    rep["date"] = np.repeat(s.to_numpy(), n) + pd.to_timedelta(offs, unit="D")
+    return rep
+
+
+def runs(days, merge):
+    days = sorted(pd.to_datetime(days))
+    if not days:
+        return []
+    out, s, prev = [], days[0], days[0]
+    for d in days[1:]:
+        if (d - prev).days <= merge + 1:
+            prev = d
+        else:
+            out.append((s, prev))
+            s = prev = d
+    out.append((s, prev))
+    return out
+
+
+# ----------------------------------------------------------------------------
+# 3. BUILD
+# ----------------------------------------------------------------------------
+def build(z, r):
+    dates = pd.date_range(f"{YEAR}-01-01", f"{YEAR}-12-31", freq="D")
+    conf = pd.read_csv(EVAL_DIR / "parish_confidence_2018.csv", dtype={"parish_fips": str})
+    cmap = conf.set_index("parish_fips").confidence
+    pname = conf.set_index("parish_fips").parish_name
+
+    info = z.drop(columns="geometry").copy()
+    info["main_parish_name"] = info.main_parish_fips.map(pname)
+    info["n_reaches"] = info.zcta.map(r.groupby("zcta").size()).fillna(0).astype(int)
+    base = info.main_parish_fips.map(cmap).fillna("unverified")
+    urban = info.urban_share.fillna(0) > URBAN_SHARE
+    info["urban"] = urban
+    info["confidence"] = np.where(urban, base.map(DOWN), base)
+    nodata = (info.n_reaches < Z_MIN_REACHES_DATA) | (base == "unverified")
+    info.loc[nodata, "confidence"] = "no data"
+    info["no_data_reason"] = np.select(
+        [base == "unverified", info.n_reaches < Z_MIN_REACHES_DATA],
+        ["unverified parish", f"< {Z_MIN_REACHES_DATA} reaches"], "")
+
+    ev = pd.read_parquet(EV_DIR / "events_nwm_2018.parquet")
+    ev = ev.merge(r, on="feature_id", how="inner")
+    ev["peak_ratio_c"] = ev.peak_ratio.clip(upper=RATIO_CAP)
+    ev["severity_norm_c"] = ev.peak_ratio_c / ev.rise_time_h
+    ev["peak_date"] = pd.to_datetime(ev.peak_date_local.astype(str).str[:10])
+
+    rd = expand_days(ev.assign(fid=ev.feature_id), "fid")
+    ext = rd.groupby(["zcta", "date"]).fid.nunique().rename("reaches_flooding")
+    pk = ev.groupby(["zcta", "peak_date"]).agg(
+        events_peaking=("feature_id", "size"),
+        magnitude_peak_ratio=("peak_ratio_c", "max"),
+        magnitude_peak_cms=("peak", "max"),
+        duration_rise_h=("rise_time_h", "median"),
+        severity_norm=("severity_norm_c", "max"),
+    ).rename_axis(["zcta", "date"])
+
+    idx = pd.MultiIndex.from_product([info.zcta, dates], names=["zcta", "date"])
+    d = pd.DataFrame(index=idx).join([ext, pk]).reset_index()
+    d[["reaches_flooding", "events_peaking"]] = d[["reaches_flooding", "events_peaking"]] \
+        .fillna(0).astype(int)
+    d = d.merge(info[["zcta", "main_parish_fips", "main_parish_name", "confidence",
+                      "n_reaches", "urban"]], on="zcta", how="left")
+    d["frac_flooding"] = d.reaches_flooding / d.n_reaches.replace(0, np.nan)
+    need = np.maximum(Z_MIN_REACHES, np.ceil(Z_MIN_FRAC * d.n_reaches))
+    d["flood_day"] = pd.array(d.reaches_flooding >= need, dtype="boolean")
+    nd = d.confidence == "no data"
+    d.loc[nd, "flood_day"] = pd.NA
+    d.loc[nd, ["magnitude_peak_ratio", "magnitude_peak_cms", "duration_rise_h",
+               "severity_norm"]] = np.nan
+    lead = ["zcta", "date", "main_parish_fips", "main_parish_name", "confidence", "flood_day",
+            "magnitude_peak_ratio", "duration_rise_h", "severity_norm", "events_peaking",
+            "reaches_flooding", "n_reaches", "frac_flooding"]
+    d = d[lead + [c for c in d.columns if c not in lead]]
+    d.to_csv(OUT_DIR / "zcta_daily_2018.csv", index=False)
+
+    # ---- events -------------------------------------------------------------
+    rows = []
+    for zc, g in d[~nd].groupby("zcta"):
+        fdays = g.loc[g.flood_day.fillna(False).astype(bool), "date"]
+        for k, (s, e) in enumerate(runs(fdays, MERGE_DAYS), 1):
+            sub = ev[(ev.zcta == zc) & ev.peak_date.between(s, e)]
+            w = g[(g.date >= s) & (g.date <= e)]
+            rows.append({
+                "zcta": zc, "event_id": f"{zc}_{YEAR}_{k:02d}",
+                "start_date": s.date(), "end_date": e.date(),
+                "length_days": (e - s).days + 1, "long_event": (e - s).days + 1 > LONG_EVENT_DAYS,
+                "peak_day": w.loc[w.reaches_flooding.idxmax(), "date"].date(),
+                "max_reaches_flooding": int(w.reaches_flooding.max()),
+                "max_frac_reaches": w.frac_flooding.max(),
+                "n_reach_events": len(sub),
+                "magnitude_max_peak_ratio": sub.peak_ratio_c.max() if len(sub) else np.nan,
+                "magnitude_max_peak_cms": sub.peak.max() if len(sub) else np.nan,
+                "duration_median_rise_h": sub.rise_time_h.median() if len(sub) else np.nan,
+                "severity_max_norm": sub.severity_norm_c.max() if len(sub) else np.nan,
+                "confidence": g.confidence.iloc[0],
+                "main_parish_name": g.main_parish_name.iloc[0]})
+    ze = pd.DataFrame(rows)
+    ze.to_csv(OUT_DIR / "zcta_events_2018.csv", index=False)
+
+    # ---- annual -------------------------------------------------------------
+    ann = info.copy()
+    if len(ze):
+        g = ze.groupby("zcta")
+        ann = ann.merge(pd.DataFrame({
+            "frequency_events": g.size(),
+            "flood_days": d[~nd].groupby("zcta").flood_day.sum(),
+            "magnitude_mean_peak_ratio": g.magnitude_max_peak_ratio.mean(),
+            "magnitude_max_peak_ratio": g.magnitude_max_peak_ratio.max(),
+            "duration_median_rise_h": g.duration_median_rise_h.median(),
+            "severity_mean_norm": g.severity_max_norm.mean(),
+            "severity_max_norm": g.severity_max_norm.max(),
+            "n_long_events": g.long_event.sum(),
+        }).reset_index(), on="zcta", how="left")
+    for c in ("frequency_events", "flood_days", "n_long_events"):
+        if c not in ann:
+            ann[c] = 0
+        ann[c] = ann[c].fillna(0)
+    ann.loc[ann.confidence == "no data", ["frequency_events", "flood_days", "n_long_events"]] = np.nan
+    flooded = ev.groupby("zcta").feature_id.nunique()
+    ann["share_reaches_flooded"] = ann.zcta.map(flooded).fillna(0) / ann.n_reaches.replace(0, np.nan)
+    ann.to_csv(OUT_DIR / "zcta_annual_2018.csv", index=False)
+    return d, ze, ann, info
+
+
+# ----------------------------------------------------------------------------
+# 4. VALIDATION WITH FLASH-FLOOD REPORTS THAT HAVE COORDINATES
+# ----------------------------------------------------------------------------
+def validate(z, d):
+    p = VAL_DIR / "storm_events_LA_2018.csv"
+    if not p.exists():
+        return "Storm Events table not found (run step 8 first) - ZCTA validation skipped."
+    se = pd.read_csv(p, dtype=str)
+    se = se[se.EVENT_TYPE.isin(["Flash Flood", "Flood"])].copy()
+    # parse the dates explicitly (read_csv's parse_dates behaves differently
+    # across pandas versions when dtype=str is also given)
+    se["begin"] = pd.to_datetime(se["begin"].astype(str).str[:10], errors="coerce")
+    se["end"] = pd.to_datetime(se["end"].astype(str).str[:10], errors="coerce")
+    se = se.dropna(subset=["begin", "end"])
+    se["lat"] = pd.to_numeric(se.BEGIN_LAT, errors="coerce")
+    se["lon"] = pd.to_numeric(se.BEGIN_LON, errors="coerce")
+    se = se.dropna(subset=["lat", "lon"])
+    if se.empty:
+        return "No flood reports with coordinates - ZCTA validation skipped."
+    pts = gpd.GeoDataFrame(se, geometry=gpd.points_from_xy(se.lon, se.lat), crs=4326)
+    se = gpd.sjoin(pts, z[["zcta", "geometry"]], how="inner", predicate="within")
+
+    # neighbours (ZCTAs that share a border)
+    nb = gpd.sjoin(z[["zcta", "geometry"]], z[["zcta", "geometry"]], predicate="touches")
+    neigh = nb.groupby("zcta_left").zcta_right.apply(set).to_dict()
+
+    have = d[d.confidence != "no data"]
+    fl = have.loc[have.flood_day.fillna(False).astype(bool), ["zcta", "date"]]
+    fd = set(zip(fl.zcta, pd.to_datetime(fl.date)))
+    valid_z = set(have.zcta)
+    rows = []
+    tol = pd.Timedelta(days=TOL_DAYS)
+    se = pd.DataFrame(se.drop(columns="geometry"))
+    for eid, etype, zc, b, e in zip(se.EVENT_ID, se.EVENT_TYPE, se.zcta,
+                                    pd.to_datetime(se.begin), pd.to_datetime(se.end)):
+        if zc not in valid_z:
+            continue
+        days = pd.date_range(pd.Timestamp(b) - tol, pd.Timestamp(e) + tol, freq="D")
+        own = any((zc, dd) in fd for dd in days)
+        near = own or any((n, dd) in fd for n in neigh.get(zc, ()) for dd in days)
+        rows.append({"EVENT_ID": eid, "type": etype, "zcta": zc,
+                     "begin": pd.Timestamp(b).date(), "detected_in_zcta": own,
+                     "detected_in_zcta_or_neighbour": near})
+    v = pd.DataFrame(rows)
+    if v.empty:
+        return "No flood reports fall in ZCTAs with data."
+    v.to_csv(OUT_DIR / "zcta_validation_reports_2018.csv", index=False)
+    lines = [f"Flood reports with coordinates in ZCTAs with data: {len(v)}",
+             f"  detected in the same ZCTA            : {v.detected_in_zcta.mean():.0%}",
+             f"  detected in the ZCTA or a neighbour  : {v.detected_in_zcta_or_neighbour.mean():.0%}"]
+    for t, g in v.groupby("type"):
+        lines.append(f"  {t:<12} n={len(g):3d}: same ZCTA {g.detected_in_zcta.mean():.0%}, "
+                     f"with neighbours {g.detected_in_zcta_or_neighbour.mean():.0%}")
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------
+# 5. FIGURES
+# ----------------------------------------------------------------------------
+def parish_outline(ax):
+    p = USGS_DIR / "la_parishes.geojson"
+    if p.exists():
+        gpd.read_file(p).boundary.plot(ax=ax, color="#555555", lw=0.4)
+
+
+def figures(z, ann):
+    g = z[["zcta", "geometry"]].merge(ann.drop(columns=["geometry"], errors="ignore"), on="zcta")
+    nd = g.confidence == "no data"
+    fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+    panels = [("frequency_events", "A. Frequency: flood events", "Blues"),
+              ("magnitude_mean_peak_ratio", "B. Magnitude: mean peak / 2-yr flow", "Oranges"),
+              ("duration_median_rise_h", "C. Duration: median rise time (h)", "Greens"),
+              ("severity_mean_norm", "D. Severity: mean peak ratio / rise time", "Reds")]
+    for ax, (col, title, cmap) in zip(axes.ravel(), panels):
+        if nd.any():
+            g[nd].plot(ax=ax, color="#bbbbbb", lw=0)
+        ok = g[~nd & g[col].notna()]
+        if len(ok):
+            ok.plot(ax=ax, column=col, cmap=cmap, lw=0, legend=True,
+                    vmax=ok[col].quantile(0.95), legend_kwds={"shrink": 0.6})
+        empty = g[~nd & g[col].isna()]
+        if len(empty):
+            empty.plot(ax=ax, color="white", lw=0)
+        parish_outline(ax)
+        ax.set_title(title)
+        ax.set_axis_off()
+    fig.suptitle(f"Louisiana ZCTA flood characteristics, {YEAR} (grey = no reliable data)",
+                 fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(FIG_DIR / "fig12_zcta_maps_2018.png", dpi=160)
+    plt.close(fig)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6.5))
+    ax = axes[0]
+    g.plot(ax=ax, column="n_reaches", cmap="viridis", lw=0, legend=True,
+           vmax=g.n_reaches.quantile(0.95), legend_kwds={"shrink": 0.6, "label": "NWM reaches"})
+    parish_outline(ax)
+    ax.set_title(f"A. Usable NWM reaches per ZCTA (< {Z_MIN_REACHES_DATA} = no data)")
+    ax.set_axis_off()
+    ax = axes[1]
+    g.plot(ax=ax, color=g.confidence.map(CONF_COLOR).fillna("#bbbbbb"), lw=0)
+    if g.urban.any():
+        g[g.urban].boundary.plot(ax=ax, color="k", lw=0.3)
+    parish_outline(ax)
+    cnt = g.confidence.value_counts()
+    ax.legend(handles=[Patch(color=c, label=f"{k} ({cnt.get(k, 0)})") for k, c in CONF_COLOR.items()],
+              loc="lower left", fontsize=8, title="ZCTA confidence")
+    ax.set_title("B. Confidence (urban ZCTAs outlined, one level lower)")
+    ax.set_axis_off()
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.9)
+    fig.savefig(FIG_DIR / "fig13_zcta_reliability.png", dpi=160)
+    plt.close(fig)
+
+
+# ----------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project-dir", default=str(PROJECT_DIR))
+    ap.add_argument("--zcta-file", default=None, help="local ZCTA shapefile / zip")
+    ap.add_argument("--rel-file", default=None, help="local ZCTA-county relationship file")
+    ap.add_argument("--ua-file", default=None, help="local urban area-ZCTA relationship file")
+    args = ap.parse_args()
+    set_paths(Path(args.project_dir))
+
+    z = load_zctas(args)
+    r = load_reaches(z)
+    # saved for step 10 (storm IDs, event types, return periods)
+    r.to_csv(OUT_DIR / "zcta_reaches.csv", index=False)
+    z.to_file(OUT_DIR / "zcta_boundaries_LA.gpkg", driver="GPKG")
+    d, ze, ann, info = build(z, r)
+    figures(z, ann)
+    vtxt = validate(z, d)
+
+    nd = info.confidence == "no data"
+    lines = [
+        f"ZCTA DATASET, LOUISIANA {YEAR}", "=" * 60,
+        f"ZCTAs: {len(info)}  (with data {int((~nd).sum())}, no reliable data {int(nd.sum())}: "
+        + ", ".join(f"{k} {v}" for k, v in info.loc[nd, 'no_data_reason'].value_counts().items()) + ")",
+        f"Reaches per ZCTA (with data): median {info.loc[~nd, 'n_reaches'].median():.0f}, "
+        f"min {info.loc[~nd, 'n_reaches'].min()}",
+        "Confidence: " + ", ".join(f"{k} {v}" for k, v in info.confidence.value_counts().items())
+        + f"  (urban ZCTAs: {int(info.urban.sum())})",
+        f"ZCTA flood days: {int(d.flood_day.sum()):,}  ({d.flood_day.mean():.1%} of ZCTA-days with data)",
+        f"ZCTA flood events: {len(ze):,}  (median per ZCTA "
+        f"{ann.loc[~nd.values, 'frequency_events'].median():.0f}; long events > {LONG_EVENT_DAYS} d: "
+        f"{int(ze.long_event.sum()) if len(ze) else 0})",
+        "", "Validation with flood reports that have coordinates:", vtxt]
+    txt = "\n".join(lines)
+    (OUT_DIR / "zcta_summary_2018.txt").write_text(txt, encoding="utf-8")
+    print(txt)
+    print(f"\nOutputs in {OUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
