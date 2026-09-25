@@ -1,0 +1,361 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Sep 25 14:30:00 2026
+
+@author: mh01
+"""
+
+"""
+STEP 8 - Validate the parish flood dataset with NOAA Storm Events (2018)
+========================================================================
+Compares your parish flood days / events (step 7) with the floods that the
+National Weather Service reported in the NOAA NCEI Storm Events Database.
+
+Reports used
+  "Flash Flood" and "Flood"           -> the validation (county/parish based)
+  "Coastal Flood", "Storm Surge/Tide" -> counted separately (not in our dataset)
+  "Heavy Rain"                        -> counted separately (information only)
+
+Two kinds of checks (a +/- TOL_DAYS window allows for timing / time-zone offsets)
+  EVENT level
+    detection rate  = share of reported parish floods that our dataset caught
+                      (any flood day in the parish within the report dates +/- 1 d)
+    confirmation    = share of our parish flood events that have a report
+                      in the same parish within +/- 1 d
+  DAY level (parish x day contingency table)
+    POD, FAR, CSI, and "frequency bias" (our flood days / reported flood days)
+
+Computed twice: local floods only, and local + big-river floods.
+
+IMPORTANT when interpreting: Storm Events lists floods that caused impacts and
+were reported. Many 2-yr-flow exceedances in rural areas never get reported,
+so a low "confirmation" does not automatically mean false alarms. Detection
+rate (did we catch the reported floods?) is the more meaningful number.
+
+Input : data/final/parish_daily_2018.csv, parish_events_2018.csv
+        Storm Events file is downloaded automatically (about 10 MB) from
+        https://www.ncei.noaa.gov/pub/data/swdi/stormevents/csvfiles/
+        or give it yourself:  --stormevents-file path\\to\\StormEvents_details...csv.gz
+Output: data/validation/  (tables, summary text, figures/fig11_validation.png)
+Usage : python 08_validate_storm_events.py
+"""
+
+import argparse
+import json
+import re
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+from matplotlib.patches import Polygon
+
+# ----------------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------------
+PROJECT_DIR = Path(r"D:\Tufts\Wishlist\Sepideh_2")
+YEAR = 2018
+STATE_FIPS = 22
+TOL_DAYS = 1
+SE_URL = "https://www.ncei.noaa.gov/pub/data/swdi/stormevents/csvfiles/"
+FLOOD_TYPES = ["Flash Flood", "Flood"]
+COASTAL_TYPES = ["Coastal Flood", "Storm Surge/Tide"]
+RAIN_TYPES = ["Heavy Rain"]
+ALL_PARISHES = [f"22{c:03d}" for c in range(1, 128, 2)]
+
+
+def set_paths(project_dir):
+    global USGS_DIR, FINAL_DIR, OUT_DIR, FIG_DIR, SE_DIR
+    USGS_DIR = project_dir / "data" / "usgs"
+    FINAL_DIR = project_dir / "data" / "final"
+    OUT_DIR = project_dir / "data" / "validation"
+    FIG_DIR = OUT_DIR / "figures"
+    SE_DIR = project_dir / "data" / "stormevents"
+    for d in (FIG_DIR, SE_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+# ----------------------------------------------------------------------------
+# STORM EVENTS
+# ----------------------------------------------------------------------------
+def get_stormevents_file(user_file=None):
+    if user_file:
+        return Path(user_file)
+    cached = sorted(SE_DIR.glob(f"StormEvents_details-ftp_v1.0_d{YEAR}_c*.csv.gz"))
+    if cached:
+        return cached[-1]
+    print("Downloading the Storm Events file list ...")
+    html = requests.get(SE_URL, timeout=120).text
+    names = sorted(set(re.findall(rf"StormEvents_details-ftp_v1\.0_d{YEAR}_c\d{{8}}\.csv\.gz", html)))
+    if not names:
+        raise RuntimeError(f"No {YEAR} details file found at {SE_URL}; download it by hand "
+                           "and pass --stormevents-file")
+    name = names[-1]                       # newest creation date
+    print(f"Downloading {name} ...")
+    r = requests.get(SE_URL + name, timeout=600)
+    r.raise_for_status()
+    (SE_DIR / name).write_bytes(r.content)
+    return SE_DIR / name
+
+
+def norm(name):
+    return re.sub(r"[^A-Z ]", "", str(name).upper().replace("SAINT", "ST")).strip()
+
+
+def load_reports(path, names):
+    se = pd.read_csv(path, dtype=str, low_memory=False)
+    se.columns = [c.upper() for c in se.columns]
+    se = se[pd.to_numeric(se.STATE_FIPS, errors="coerce") == STATE_FIPS].copy()
+    se["begin"] = pd.to_datetime(se.BEGIN_YEARMONTH + se.BEGIN_DAY.str.zfill(2), format="%Y%m%d")
+    se["end"] = pd.to_datetime(se.END_YEARMONTH + se.END_DAY.str.zfill(2), format="%Y%m%d")
+
+    # county-based reports -> parish FIPS directly
+    cz = pd.to_numeric(se.CZ_FIPS, errors="coerce").fillna(0).astype(int).astype(str).str.zfill(3)
+    se["parish_fips"] = np.where(se.CZ_TYPE == "C", "22" + cz, None)
+    # zone-based reports (mostly coastal) -> match the parish name inside the zone name
+    lookup = {norm(v): k for k, v in names.items()}
+
+    def zone_to_parish(z):
+        z = norm(z)
+        hits = [n for n in lookup if re.search(rf"\b{re.escape(n)}\b", z)]
+        return lookup[max(hits, key=len)] if hits else None
+
+    zmask = se.CZ_TYPE == "Z"
+    se.loc[zmask, "parish_fips"] = se.loc[zmask, "CZ_NAME"].map(zone_to_parish)
+    se = se[se.parish_fips.isin(ALL_PARISHES)]
+    keep = ["EVENT_ID", "EPISODE_ID", "EVENT_TYPE", "CZ_TYPE", "CZ_NAME", "parish_fips",
+            "begin", "end", "FLOOD_CAUSE", "DAMAGE_PROPERTY", "BEGIN_LAT", "BEGIN_LON",
+            "EVENT_NARRATIVE"]
+    return se[[c for c in keep if c in se.columns]].reset_index(drop=True)
+
+
+def expand(df, s_col, e_col, id_col):
+    df = df.reset_index(drop=True)
+    s = df[s_col].clip(lower=pd.Timestamp(f"{YEAR}-01-01"))
+    e = df[e_col].clip(upper=pd.Timestamp(f"{YEAR}-12-31"))
+    n = ((e - s).dt.days + 1).clip(lower=0)
+    rep = df.loc[df.index.repeat(n), [id_col, "parish_fips"]].copy()
+    offs = np.concatenate([np.arange(k) for k in n]) if len(n) else np.array([], int)
+    rep["date"] = np.repeat(s.to_numpy(), n) + pd.to_timedelta(offs, unit="D")
+    return rep
+
+
+def dilate(days, tol):
+    """(parish, date) pairs widened by +/- tol days."""
+    parts = [days.assign(date=days.date + pd.Timedelta(days=k)) for k in range(-tol, tol + 1)]
+    return set(map(tuple, pd.concat(parts)[["parish_fips", "date"]].to_numpy()))
+
+
+# ----------------------------------------------------------------------------
+# VALIDATION
+# ----------------------------------------------------------------------------
+def validate(daily, pevents, reports, pred_col, label):
+    have = daily[daily.source != "none"]
+    parishes = set(have.parish_fips)
+    rep = reports[reports.parish_fips.isin(parishes)].copy()
+
+    # report events: merge reports of the same parish and NWS episode
+    rep["key"] = rep.parish_fips + "_" + rep.EPISODE_ID.fillna(rep.EVENT_ID)
+    rev = rep.groupby("key").agg(
+        parish_fips=("parish_fips", "first"), begin=("begin", "min"), end=("end", "max"),
+        types=("EVENT_TYPE", lambda s: ";".join(sorted(set(s)))),
+        n_reports=("EVENT_ID", "size")).reset_index()
+    pred_days = have.loc[have[pred_col].fillna(False).astype(bool), ["parish_fips", "date"]]
+    pred_wide = dilate(pred_days, TOL_DAYS) if len(pred_days) else set()
+    rev["detected"] = [any((p, d) in pred_wide for d in pd.date_range(b, e))
+                       for p, b, e in zip(rev.parish_fips, rev.begin, rev.end)]
+
+    # our parish events confirmed by a report
+    obs_days = expand(rep, "begin", "end", "EVENT_ID")[["parish_fips", "date"]].drop_duplicates()
+    obs_wide = dilate(obs_days, TOL_DAYS) if len(obs_days) else set()
+    pe = pevents[pevents.parish_fips.isin(parishes)].copy()
+    pe["confirmed"] = [any((p, d) in obs_wide for d in pd.date_range(s, e))
+                       for p, s, e in zip(pe.parish_fips, pe.start_date, pe.end_date)]
+
+    # day-level contingency
+    obs_set = set(map(tuple, obs_days.to_numpy()))
+    pred_set = set(map(tuple, pred_days.to_numpy()))
+    hits = sum(1 for x in obs_set if x in pred_wide)
+    misses = len(obs_set) - hits
+    fa = sum(1 for x in pred_set if x not in obs_wide)
+    summ = {
+        "prediction": label,
+        "reported_parish_floods": len(rev),
+        "detected": int(rev.detected.sum()),
+        "detection_rate": rev.detected.mean() if len(rev) else np.nan,
+        "our_parish_events": len(pe),
+        "confirmed_by_report": int(pe.confirmed.sum()),
+        "confirmation_rate": pe.confirmed.mean() if len(pe) else np.nan,
+        "reported_flood_days": len(obs_set), "predicted_flood_days": len(pred_set),
+        "POD_days": hits / len(obs_set) if obs_set else np.nan,
+        "FAR_days": fa / len(pred_set) if pred_set else np.nan,
+        "CSI_days": hits / (hits + misses + fa) if (hits + misses + fa) else np.nan,
+        "frequency_bias": len(pred_set) / len(obs_set) if obs_set else np.nan,
+    }
+    return summ, rev, pe
+
+
+def by_group(rev, pe, conf_map, col_name):
+    rev = rev.assign(g=rev.parish_fips.map(conf_map))
+    pe = pe.assign(g=pe.parish_fips.map(conf_map))
+    a = rev.groupby("g").agg(reported=("key", "size"), detected=("detected", "sum"))
+    b = pe.groupby("g").agg(our_events=("confirmed", "size"), confirmed=("confirmed", "sum"))
+    t = a.join(b, how="outer").fillna(0)
+    t["detection_rate"] = t.detected / t.reported.replace(0, np.nan)
+    t["confirmation_rate"] = t.confirmed / t.our_events.replace(0, np.nan)
+    return t.rename_axis(col_name).reset_index()
+
+
+# ----------------------------------------------------------------------------
+# FIGURE
+# ----------------------------------------------------------------------------
+def load_shapes():
+    gj = json.loads((USGS_DIR / "la_parishes.geojson").read_text())
+    shapes, names = {}, {}
+    for f in gj["features"]:
+        g = f["geometry"]
+        polys = g["coordinates"] if g["type"] == "MultiPolygon" else [g["coordinates"]]
+        shapes[f["id"]] = [np.asarray(p[0]) for p in polys]
+        names[f["id"]] = f["properties"].get("NAME", f["id"])
+    return shapes, names
+
+
+def choropleth(ax, fig, shapes, values, title, label, nodata):
+    cm = plt.get_cmap("RdYlGn")
+    for fips, rings in shapes.items():
+        v = values.get(fips, np.nan)
+        fc = "#bbbbbb" if fips in nodata else ("white" if pd.isna(v) else cm(v))
+        for ring in rings:
+            ax.add_patch(Polygon(ring, closed=True, fc=fc, ec="#666666", lw=0.4,
+                                 hatch="..." if (pd.isna(v) and fips not in nodata) else None))
+    ax.set_xlim(-94.1, -88.8)
+    ax.set_ylim(28.9, 33.1)
+    ax.set_aspect(1.15)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    sm = plt.cm.ScalarMappable(cmap=cm, norm=plt.Normalize(0, 100))
+    fig.colorbar(sm, ax=ax, shrink=0.6, label=label)
+    ax.set_title(title, fontsize=10)
+
+
+def figure(rev, pe, reports, daily, conf_tab, shapes, nodata):
+    fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+    choropleth(axes[0, 0], fig, shapes, rev.groupby("parish_fips").detected.mean().to_dict(),
+               "A. Reported floods we detected (%)\n(dotted = no flood report in 2018, grey = no data)",
+               "% detected", nodata)
+    choropleth(axes[0, 1], fig, shapes, pe.groupby("parish_fips").confirmed.mean().to_dict(),
+               "B. Our flood events with a matching report (%)\n(dotted = no event in our data)",
+               "% confirmed", nodata)
+
+    ax = axes[1, 0]
+    months = np.arange(1, 13)
+    fl = reports[reports.EVENT_TYPE.isin(FLOOD_TYPES)]
+    od = expand(fl, "begin", "end", "EVENT_ID")[["parish_fips", "date"]].drop_duplicates()
+    o = od.date.dt.month.value_counts().reindex(months, fill_value=0)
+    p = (daily[daily.flood_day.fillna(False).astype(bool)].date.dt.month
+         .value_counts().reindex(months, fill_value=0))
+    ax.bar(months - 0.2, p, 0.4, color="#d62728", label="our parish flood days")
+    ax.bar(months + 0.2, o, 0.4, color="k", label="reported flood parish-days (Storm Events)")
+    ax.set(xticks=months, xticklabels=list("JFMAMJJASOND"), ylabel="parish-days",
+           title="C. When floods happened: our dataset vs reports")
+    ax.legend(fontsize=8)
+
+    ax = axes[1, 1]
+    t = conf_tab.set_index("confidence").reindex(["high", "medium", "low"]).dropna(how="all")
+    x = np.arange(len(t))
+    ax.bar(x - 0.2, 100 * t.detection_rate, 0.4, color="#2ca02c", label="reported floods detected")
+    ax.bar(x + 0.2, 100 * t.confirmation_rate, 0.4, color="#1f77b4", label="our events confirmed")
+    for i, (_, r) in enumerate(t.iterrows()):
+        ax.text(i - 0.2, 100 * np.nan_to_num(r.detection_rate) + 1, f"n={int(r.reported)}",
+                ha="center", fontsize=8)
+        ax.text(i + 0.2, 100 * np.nan_to_num(r.confirmation_rate) + 1, f"n={int(r.our_events)}",
+                ha="center", fontsize=8)
+    ax.set(xticks=x, xticklabels=t.index, ylim=(0, 105), ylabel="%",
+           title="D. Agreement by parish confidence level")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(FIG_DIR / "fig11_validation.png", dpi=160)
+    plt.close(fig)
+
+
+# ----------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project-dir", default=str(PROJECT_DIR))
+    ap.add_argument("--stormevents-file", default=None)
+    args = ap.parse_args()
+    set_paths(Path(args.project_dir))
+
+    shapes, names = load_shapes()
+    daily = pd.read_csv(FINAL_DIR / "parish_daily_2018.csv",
+                        dtype={"parish_fips": str, "flood_day": "boolean"}, parse_dates=["date"])
+    daily["flood_or_big"] = (daily.flood_day.fillna(False).astype(bool)
+                             | daily.big_river_flood_day.astype(bool))
+    daily.loc[daily.source == "none", "flood_or_big"] = False
+    pevents = pd.read_csv(FINAL_DIR / "parish_events_2018.csv", dtype={"parish_fips": str},
+                          parse_dates=["start_date", "end_date"])
+    conf_map = daily.drop_duplicates("parish_fips").set_index("parish_fips").confidence
+    nodata = set(daily.loc[daily.source == "none", "parish_fips"])
+
+    path = get_stormevents_file(args.stormevents_file)
+    allrep = load_reports(path, names)
+    allrep.to_csv(OUT_DIR / "storm_events_LA_2018.csv", index=False)
+    reports = allrep[allrep.EVENT_TYPE.isin(FLOOD_TYPES)]
+
+    res, keep = [], {}
+    for col, lab in (("flood_day", "local floods"), ("flood_or_big", "local + big-river floods")):
+        s, rev, pe = validate(daily, pevents, reports, col, lab)
+        res.append(s)
+        keep[col] = (rev, pe)
+    summ = pd.DataFrame(res)
+    summ.to_csv(OUT_DIR / "validation_summary_2018.csv", index=False)
+
+    rev, pe = keep["flood_day"]
+    rev.assign(parish_name=rev.parish_fips.map(names)).to_csv(
+        OUT_DIR / "reported_floods_matched_2018.csv", index=False)
+    pe.to_csv(OUT_DIR / "our_events_confirmed_2018.csv", index=False)
+    conf_tab = by_group(rev, pe, conf_map, "confidence")
+    conf_tab.to_csv(OUT_DIR / "validation_by_confidence_2018.csv", index=False)
+    type_tab = (rev.assign(ftype=np.where(rev.types.str.contains("Flash"), "Flash Flood", "Flood"))
+                .groupby("ftype").agg(reported=("key", "size"), detected=("detected", "sum")))
+    type_tab["detection_rate"] = type_tab.detected / type_tab.reported
+
+    per = pd.DataFrame({"parish_fips": ALL_PARISHES})
+    per["parish_name"] = per.parish_fips.map(names)
+    per["confidence"] = per.parish_fips.map(conf_map)
+    g = rev.groupby("parish_fips")
+    per["reported_floods"] = per.parish_fips.map(g.size()).fillna(0).astype(int)
+    per["detected"] = per.parish_fips.map(g.detected.sum()).fillna(0).astype(int)
+    h = pe.groupby("parish_fips")
+    per["our_events"] = per.parish_fips.map(h.size()).fillna(0).astype(int)
+    per["confirmed"] = per.parish_fips.map(h.confirmed.sum()).fillna(0).astype(int)
+    per.to_csv(OUT_DIR / "validation_by_parish_2018.csv", index=False)
+
+    figure(rev, pe, allrep, daily, conf_tab, shapes, nodata)
+
+    # plain-language summary
+    cnt = allrep.EVENT_TYPE.value_counts()
+    L = ["STORM EVENTS VALIDATION, LOUISIANA 2018", "=" * 60,
+         f"Storm Events file: {path.name}",
+         "Reports in Louisiana: " + ", ".join(f"{t} {cnt.get(t, 0)}"
+                                              for t in FLOOD_TYPES + COASTAL_TYPES + RAIN_TYPES),
+         "(coastal/surge reports are not used: our dataset has no coastal flooding)", ""]
+    for _, r in summ.iterrows():
+        L += [f"[{r.prediction}]",
+              f"  Reported parish floods detected : {r.detected}/{r.reported_parish_floods} "
+              f"({r.detection_rate:.0%})",
+              f"  Our events confirmed by a report: {r.confirmed_by_report}/{r.our_parish_events} "
+              f"({r.confirmation_rate:.0%})",
+              f"  Day level: POD {r.POD_days:.2f}, FAR {r.FAR_days:.2f}, CSI {r.CSI_days:.2f}, "
+              f"bias {r.frequency_bias:.1f} (our flood days / reported flood days)", ""]
+    L += ["By flood type (local floods):", type_tab.round(2).to_string(), "",
+          "By parish confidence (local floods):", conf_tab.round(2).to_string(index=False)]
+    txt = "\n".join(L)
+    (OUT_DIR / "validation_summary.txt").write_text(txt, encoding="utf-8")
+    print(txt)
+    print(f"\nOutputs in {OUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
