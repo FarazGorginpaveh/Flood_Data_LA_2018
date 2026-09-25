@@ -1,0 +1,556 @@
+"""
+STEP 1 - Download USGS streamflow data for Louisiana (2018)
+===========================================================
+Project : County (parish)-level flood characteristics - frequency, magnitude,
+          duration, severity - for Louisiana in 2018. Inspired by
+          Khajehei et al. (2020), Sci. Rep. 10:448, doi:10.1038/s41598-019-57349-z
+
+Source  : USGS Water Data APIs (OGC API - Features), https://api.waterdata.usgs.gov
+          The legacy NWIS WaterServices (waterservices.usgs.gov, dataretrieval.nwis)
+          are being decommissioned in early 2027, so this script only uses the
+          modernized endpoints.
+
+What it downloads (into D:\\Tufts\\Wishlist\\Sepideh_2\\data\\usgs)
+------------------------------------------------------------------
+  1. sites_LA.csv                  Louisiana surface-water monitoring locations
+                                   (lat/lon, parish FIPS, drainage area, ...)
+  2. timeseries_metadata_LA.csv    discharge / gage-height series at those sites
+     thresholds_LA.csv             reference levels stored with each series
+                                   (includes NWS flood stage where USGS has it)
+  3. continuous/<site>_<param>.*   ~15-min discharge (00060, cfs) and gage height
+                                   (00065, ft) for 2018 + padding on both sides,
+                                   so events crossing Jan 1 / Dec 31 are complete
+     continuous_manifest.csv       what was downloaded per site/parameter
+  4. daily_discharge_LA.*          daily mean discharge (00060, stat 00003),
+                                   downloaded in groups of 20 sites (daily_parts/)
+  5. annual_peaks_LA.csv           full-record annual peaks (for flood-frequency
+                                   thresholds such as the 2-yr flow)
+  6. parish_coverage.csv           how many gauges each of the 64 parishes has
+
+The paper's definitions (for the next step, not computed here):
+  event     : flow above the gauge's action stage/threshold
+  magnitude : peak flow of the event
+  duration  : rise time = time of peak - time threshold was first exceeded
+  severity  : magnitude / duration
+  frequency : number of events
+That is why sub-daily (continuous) data are downloaded, not only daily means.
+
+Requirements : pip install requests pandas pyarrow tqdm
+API key      : free, https://api.waterdata.usgs.gov/signup/
+               then (Windows cmd)  setx USGS_API_KEY "your_key"   and reopen the terminal
+Usage        : python 01_download_usgs_streamflow.py            (all steps)
+               python 01_download_usgs_streamflow.py --steps 1 2 (only some steps)
+The script is resumable: finished files are skipped on re-run.
+"""
+
+import argparse
+import json
+import logging
+import os
+import time
+from pathlib import Path
+
+import pandas as pd
+import requests
+
+try:
+    from tqdm import tqdm
+except ImportError:  # progress bar is optional
+    def tqdm(x, **kwargs):
+        return x
+
+# ----------------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------------
+PROJECT_DIR = Path(r"D:\Tufts\Wishlist\Sepideh_2")
+OUT_DIR = PROJECT_DIR / "data" / "usgs"
+CONT_DIR = OUT_DIR / "continuous"
+
+API_KEY = "///"
+
+BASE = "https://api.waterdata.usgs.gov/ogcapi/v1/collections"
+
+STATE_NAME = "Louisiana"
+STATE_FIPS = "22"
+# Louisiana bounding box (lon_min, lat_min, lon_max, lat_max); results are then
+# filtered to state_code 22, so neighbouring MS/AR/TX gauges are dropped.
+LA_BBOX = (-94.10, 28.80, -88.70, 33.10)
+
+YEAR = 2018
+PAD_DAYS = 31   # extra days before/after the year so boundary events are complete
+START = pd.Timestamp(f"{YEAR}-01-01", tz="UTC") - pd.Timedelta(days=PAD_DAYS)
+END = pd.Timestamp(f"{YEAR}-12-31 23:59:59", tz="UTC") + pd.Timedelta(days=PAD_DAYS)
+
+PARAMS = {"00060": "discharge_cfs", "00065": "gage_height_ft"}
+
+# Surface-water site types. Louisiana has many tidal/estuarine gauges, so they
+# are kept here; you can drop them later during event extraction.
+SITE_TYPES = ["ST", "ST-CA", "ST-DCH", "ST-TS", "ES"]
+
+PAGE_LIMIT = 50000      # max records per page allowed by the API
+CQL_CHUNK = 100         # site IDs per CQL "in" query
+DAILY_CHUNK = 20        # sites per daily-values request (bigger groups time out)
+PAUSE = 0.25            # seconds between requests (be polite)
+
+# All 64 Louisiana parishes have odd FIPS codes 001..127
+ALL_PARISH_FIPS = [f"{STATE_FIPS}{c:03d}" for c in range(1, 128, 2)]
+
+# ----------------------------------------------------------------------------
+# LOGGING
+# ----------------------------------------------------------------------------
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+CONT_DIR.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    handlers=[logging.FileHandler(OUT_DIR / "download_log.txt", encoding="utf-8"),
+              logging.StreamHandler()],
+)
+log = logging.getLogger("usgs")
+
+# ----------------------------------------------------------------------------
+# HTTP HELPERS
+# ----------------------------------------------------------------------------
+session = requests.Session()
+session.headers.update({"Accept": "application/geo+json, application/json",
+                        "User-Agent": "Tufts-LA-flood-study/1.0"})
+if API_KEY:
+    session.headers["X-Api-Key"] = API_KEY
+
+
+def _respect_rate_limit(resp):
+    """Pause when the hourly quota is almost used up."""
+    remaining = resp.headers.get("X-RateLimit-Remaining")
+    if remaining is not None and remaining.isdigit() and int(remaining) < 5:
+        log.warning("Rate limit almost exhausted (%s left). Pausing 10 min.", remaining)
+        time.sleep(600)
+
+
+def _request(url, params=None, cql=None, max_tries=6):
+    """GET (or POST with a CQL2-JSON body) with retries and back-off."""
+    for attempt in range(1, max_tries + 1):
+        try:
+            if cql is None:
+                r = session.get(url, params=params, timeout=300)
+            else:
+                r = session.post(url, params=params, data=json.dumps(cql),
+                                 headers={"Content-Type": "application/query-cql-json"},
+                                 timeout=300)
+        except requests.RequestException as exc:
+            wait = 10 * attempt
+            log.warning("Network error (%s). Retry %d/%d in %ds", exc, attempt, max_tries, wait)
+            time.sleep(wait)
+            continue
+
+        if r.status_code == 200:
+            _respect_rate_limit(r)
+            time.sleep(PAUSE)
+            return r.json()
+        if r.status_code == 429:
+            wait = int(r.headers.get("Retry-After", 120 * attempt))
+            log.warning("429 Too Many Requests. Waiting %ds (get an API key!)", wait)
+            time.sleep(wait)
+            continue
+        if r.status_code in (500, 502, 503, 504):
+            wait = 15 * attempt
+            log.warning("Server error %d. Retry %d/%d in %ds", r.status_code, attempt, max_tries, wait)
+            time.sleep(wait)
+            continue
+        # 4xx other than 429: a problem with the query itself
+        raise RuntimeError(f"HTTP {r.status_code} for {r.url}\n{r.text[:800]}")
+    raise RuntimeError(f"Giving up after {max_tries} tries: {url}")
+
+
+def fetch_all(collection, params=None, cql=None):
+    """Return all features of a collection query, following 'next' links."""
+    url = f"{BASE}/{collection}/items"
+    query = {"f": "json", "limit": PAGE_LIMIT}
+    query.update(params or {})
+    features = []
+    while url:
+        js = _request(url, params=query, cql=cql)
+        page = js.get("features", []) or []
+        features.extend(page)
+        nxt = next((lk["href"] for lk in js.get("links", []) if lk.get("rel") == "next"), None)
+        if not page or nxt is None:
+            break
+        url, query = nxt, None      # the next link already carries the query string
+    return features
+
+
+def fetch_all_safe(collection, params):
+    """Same as fetch_all, but retries without 'properties' if the server rejects it."""
+    try:
+        return fetch_all(collection, params)
+    except RuntimeError as exc:
+        if "HTTP 400" in str(exc) and "properties" in params:
+            log.warning("Server rejected 'properties'; retrying with all fields.")
+            p = {k: v for k, v in params.items() if k != "properties"}
+            return fetch_all(collection, p)
+        raise
+
+
+def features_to_df(features, keep_geometry=False):
+    rows = []
+    for f in features:
+        row = dict(f.get("properties") or {})
+        row["feature_id"] = f.get("id")
+        geom = f.get("geometry")
+        if keep_geometry and geom and geom.get("type") == "Point":
+            row["lon"], row["lat"] = geom["coordinates"][:2]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def cql_in(prop, values):
+    return {"op": "in", "args": [{"property": prop}, list(values)]}
+
+
+def cql_and(*clauses):
+    return {"op": "and", "args": list(clauses)}
+
+
+def chunks(seq, n):
+    seq = list(seq)
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
+def to_list_str(x):
+    """Qualifiers may come back as a list; store them as 'A;B' strings."""
+    if isinstance(x, (list, tuple)):
+        return ";".join(map(str, x))
+    return x
+
+
+# ---- saving: parquet if pyarrow is installed, otherwise gzipped CSV ----------
+try:
+    import pyarrow  # noqa: F401
+    EXT = ".parquet"
+except ImportError:
+    EXT = ".csv.gz"
+    log.warning("pyarrow not installed -> saving as .csv.gz (pip install pyarrow for parquet)")
+
+
+def save_table(df, path_no_ext):
+    path = Path(str(path_no_ext) + EXT)
+    if EXT == ".parquet":
+        df.to_parquet(path, index=False)
+    else:
+        df.to_csv(path, index=False, compression="gzip")
+    return path
+
+
+def read_table(path):
+    path = Path(path)
+    if path.suffix == ".parquet":
+        return pd.read_parquet(path)
+    return pd.read_csv(path, dtype=str)
+
+
+def exists_table(path_no_ext):
+    return Path(str(path_no_ext) + EXT).exists()
+
+
+# ----------------------------------------------------------------------------
+# STEP 1 - Louisiana monitoring locations
+# ----------------------------------------------------------------------------
+def step1_sites():
+    out = OUT_DIR / "sites_LA.csv"
+    if out.exists():
+        log.info("[1] sites_LA.csv exists - loading.")
+        return pd.read_csv(out, dtype=str)
+
+    log.info("[1] Querying monitoring locations inside the Louisiana bbox ...")
+    frames = []
+    for st in SITE_TYPES:
+        feats = fetch_all("monitoring-locations",
+                          {"bbox": ",".join(map(str, LA_BBOX)), "site_type_code": st})
+        df = features_to_df(feats, keep_geometry=True)
+        log.info("    site_type %-6s: %5d locations in bbox", st, len(df))
+        if not df.empty:
+            frames.append(df)
+    if not frames:
+        raise RuntimeError("No monitoring locations returned - check the API / bbox.")
+    sites = pd.concat(frames, ignore_index=True)
+
+    # keep only Louisiana
+    if "state_code" in sites.columns:
+        sites["state_code"] = sites["state_code"].astype(str).str.zfill(2)
+        sites = sites[sites["state_code"] == STATE_FIPS].copy()
+    else:
+        sites = sites[sites["state_name"] == STATE_NAME].copy()
+    sites["county_code"] = sites["county_code"].astype(str).str.zfill(3)
+    sites["parish_fips"] = STATE_FIPS + sites["county_code"]
+    sites = sites.rename(columns={"feature_id": "monitoring_location_id"})
+    sites = sites.drop_duplicates("monitoring_location_id")
+
+    sites.to_csv(out, index=False)
+    log.info("[1] %d Louisiana surface-water locations saved -> %s", len(sites), out)
+    return pd.read_csv(out, dtype=str)
+
+
+# ----------------------------------------------------------------------------
+# STEP 2 - time-series metadata (which sites actually have 2018 data) + thresholds
+# ----------------------------------------------------------------------------
+def step2_timeseries(sites):
+    out_ts = OUT_DIR / "timeseries_metadata_LA.csv"
+    out_thr = OUT_DIR / "thresholds_LA.csv"
+    if out_ts.exists():
+        log.info("[2] timeseries_metadata_LA.csv exists - loading.")
+        return pd.read_csv(out_ts, dtype=str)
+
+    log.info("[2] Querying time-series metadata for %d sites ...", len(sites))
+    frames = []
+    for ids in tqdm(list(chunks(sites["monitoring_location_id"], CQL_CHUNK)), desc="ts-metadata"):
+        cql = cql_and(cql_in("monitoring_location_id", ids),
+                      cql_in("parameter_code", PARAMS.keys()))
+        frames.append(features_to_df(fetch_all("time-series-metadata", cql=cql)))
+    ts = pd.concat(frames, ignore_index=True).rename(columns={"feature_id": "time_series_id"})
+
+    # --- thresholds (list of dicts per series) -> flat table -----------------
+    thr_rows = []
+    for _, r in ts.iterrows():
+        ths = r.get("thresholds")
+        for th in (ths if isinstance(ths, list) else []):
+            for per in (th.get("Periods") or [{}]):
+                thr_rows.append({
+                    "time_series_id": r["time_series_id"],
+                    "monitoring_location_id": r["monitoring_location_id"],
+                    "parameter_code": r["parameter_code"],
+                    "threshold_name": th.get("Name"),
+                    "reference_code": th.get("ReferenceCode"),
+                    "threshold_type": th.get("Type"),
+                    "value": per.get("ReferenceValue"),
+                    "valid_from": per.get("StartTime"),
+                    "valid_to": per.get("EndTime"),
+                })
+    pd.DataFrame(thr_rows).to_csv(out_thr, index=False)
+    log.info("[2] %d threshold records saved -> %s", len(thr_rows), out_thr)
+
+    ts = ts.drop(columns=["thresholds"], errors="ignore")
+    ts.to_csv(out_ts, index=False)
+    log.info("[2] %d time series saved -> %s", len(ts), out_ts)
+    return pd.read_csv(out_ts, dtype=str)
+
+
+def select_series(ts, period_id, computation_id=None):
+    """Series of the given type whose period of record overlaps START..END."""
+    bcol = "begin" if "begin" in ts.columns else "start"
+    sel = ts[ts["computation_period_identifier"] == period_id].copy()
+    if computation_id:
+        sel = sel[sel["computation_identifier"] == computation_id]
+    b = pd.to_datetime(sel[bcol], utc=True, errors="coerce")
+    e = pd.to_datetime(sel["end"], utc=True, errors="coerce")
+    return sel[(b <= END) & (e >= START)]
+
+
+# ----------------------------------------------------------------------------
+# STEP 3 - continuous (~15-min) discharge and gage height
+# ----------------------------------------------------------------------------
+def step3_continuous(ts):
+    cont = select_series(ts, "Points", "Instantaneous")
+    jobs = cont[["monitoring_location_id", "parameter_code"]].drop_duplicates()
+    log.info("[3] %d site/parameter combinations with continuous data overlapping %d "
+             "(%d discharge, %d gage height)", len(jobs), YEAR,
+             (jobs.parameter_code == "00060").sum(), (jobs.parameter_code == "00065").sum())
+
+    manifest_path = OUT_DIR / "continuous_manifest.csv"
+    manifest = (pd.read_csv(manifest_path, dtype=str) if manifest_path.exists()
+                else pd.DataFrame(columns=["monitoring_location_id", "parameter_code"]))
+    done = set(zip(manifest.monitoring_location_id, manifest.parameter_code))
+
+    dt = f"{START:%Y-%m-%dT%H:%M:%SZ}/{END:%Y-%m-%dT%H:%M:%SZ}"
+    props = ("time_series_id,monitoring_location_id,parameter_code,time,value,"
+             "unit_of_measure,approval_status,qualifier")
+    new_rows = []
+
+    for site, pc in tqdm(list(jobs.itertuples(index=False, name=None)), desc="continuous"):
+        if (site, pc) in done:
+            continue
+        stem = CONT_DIR / f"{site}_{pc}"
+        try:
+            feats = fetch_all_safe("continuous", {
+                "monitoring_location_id": site, "parameter_code": pc,
+                "datetime": dt, "skipGeometry": "true", "properties": props})
+        except RuntimeError as exc:
+            log.error("    %s %s failed: %s", site, pc, str(exc)[:200])
+            new_rows.append({"monitoring_location_id": site, "parameter_code": pc,
+                             "status": "error", "n_values": 0})
+            continue
+
+        df = features_to_df(feats).drop(columns=["feature_id"], errors="ignore")
+        if df.empty:
+            new_rows.append({"monitoring_location_id": site, "parameter_code": pc,
+                             "status": "no_data", "n_values": 0})
+            continue
+
+        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        if "qualifier" in df.columns:
+            df["qualifier"] = df["qualifier"].map(to_list_str)
+        df = df.sort_values(["time_series_id", "time"]).reset_index(drop=True)
+        save_table(df, stem)
+
+        step_min = df.groupby("time_series_id")["time"].diff().dt.total_seconds().div(60).median()
+        new_rows.append({
+            "monitoring_location_id": site, "parameter_code": pc, "status": "ok",
+            "n_values": len(df), "n_series": df["time_series_id"].nunique(),
+            "first": df["time"].min(), "last": df["time"].max(),
+            "median_step_min": step_min,
+            "frac_provisional": (df.get("approval_status") == "Provisional").mean()
+            if "approval_status" in df.columns else None,
+        })
+        # write the manifest every 25 downloads so a crash loses little
+        if len(new_rows) % 25 == 0:
+            pd.concat([manifest, pd.DataFrame(new_rows)]).to_csv(manifest_path, index=False)
+
+    manifest = pd.concat([manifest, pd.DataFrame(new_rows)], ignore_index=True)
+    manifest.to_csv(manifest_path, index=False)
+    ok = manifest[manifest.status == "ok"]
+    log.info("[3] continuous done: %d ok, %d no data, %d errors", len(ok),
+             (manifest.status == "no_data").sum(), (manifest.status == "error").sum())
+    return manifest
+
+
+# ----------------------------------------------------------------------------
+# STEP 4 - daily mean discharge (one bbox query instead of one call per site)
+# ----------------------------------------------------------------------------
+def step4_daily(sites, ts):
+    """Daily mean discharge, requested in small groups of sites.
+
+    A single bbox query for the whole state times out on the USGS server
+    ("Long running query has been cancelled"), so we only ask for the sites
+    whose metadata says they have daily mean discharge overlapping the period,
+    DAILY_CHUNK sites per request, and fall back to one site per request if a
+    group still times out. Each group is saved as a part file, so the step
+    is resumable.
+    """
+    stem = OUT_DIR / "daily_discharge_LA"
+    if exists_table(stem):
+        log.info("[4] daily discharge exists - skipping.")
+        return
+
+    daily = select_series(ts, "Daily", "Mean")
+    daily = daily[(daily["parameter_code"] == "00060") & (daily["statistic_id"] == "00003")]
+    q_sites = sorted(set(daily["monitoring_location_id"]) & set(sites["monitoring_location_id"]))
+    log.info("[4] Downloading daily mean discharge for %d sites ...", len(q_sites))
+
+    part_dir = OUT_DIR / "daily_parts"
+    part_dir.mkdir(exist_ok=True)
+    base = {"parameter_code": "00060", "statistic_id": "00003",
+            "datetime": f"{START:%Y-%m-%d}/{END:%Y-%m-%d}", "skipGeometry": "true"}
+
+    groups = list(chunks(q_sites, DAILY_CHUNK))
+    for i, ids in enumerate(tqdm(groups, desc="daily")):
+        part = part_dir / f"part_{i:03d}"
+        if exists_table(part):
+            continue
+        try:
+            feats = fetch_all("daily", base, cql=cql_in("monitoring_location_id", ids))
+        except RuntimeError as exc:
+            log.warning("    group %d failed (%s) - retrying one site at a time", i, str(exc)[:120])
+            feats = []
+            for s in ids:
+                try:
+                    feats += fetch_all("daily", {**base, "monitoring_location_id": s})
+                except RuntimeError as exc2:
+                    log.error("    %s failed: %s", s, str(exc2)[:200])
+        part_df = features_to_df(feats).drop(columns=["feature_id"], errors="ignore")
+        if "qualifier" in part_df.columns:
+            part_df["qualifier"] = part_df["qualifier"].map(to_list_str)
+        if part_df.empty:
+            part_df = pd.DataFrame(columns=["monitoring_location_id", "time", "value"])
+        save_table(part_df.astype(str), part)
+
+    parts = [read_table(p) for p in sorted(part_dir.glob("part_*" + EXT))]
+    df = pd.concat(parts, ignore_index=True)
+    df = df[df["monitoring_location_id"].isin(set(q_sites))].copy()
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    if "qualifier" in df.columns:
+        df["qualifier"] = df["qualifier"].map(to_list_str)
+    path = save_table(df.sort_values(["monitoring_location_id", "time"]), stem)
+    log.info("[4] %d daily values at %d LA sites -> %s", len(df),
+             df["monitoring_location_id"].nunique(), path)
+
+
+# ----------------------------------------------------------------------------
+# STEP 5 - annual peak flows (full record) for flood-frequency thresholds
+# ----------------------------------------------------------------------------
+def step5_peaks(ts):
+    out = OUT_DIR / "annual_peaks_LA.csv"
+    if out.exists():
+        log.info("[5] annual_peaks_LA.csv exists - skipping.")
+        return
+    q_sites = ts.loc[ts.parameter_code == "00060", "monitoring_location_id"].unique()
+    log.info("[5] Downloading annual peaks for %d discharge sites ...", len(q_sites))
+    frames = []
+    for ids in tqdm(list(chunks(q_sites, CQL_CHUNK)), desc="peaks"):
+        cql = cql_and(cql_in("monitoring_location_id", ids),
+                      cql_in("parameter_code", ["00060", "00065"]))
+        try:
+            frames.append(features_to_df(fetch_all("peaks", {"skipGeometry": "true"}, cql=cql)))
+        except RuntimeError as exc:   # fall back to one GET per site
+            log.warning("    CQL query on /peaks failed (%s); falling back to per-site", str(exc)[:120])
+            for s in ids:
+                frames.append(features_to_df(fetch_all("peaks", {
+                    "monitoring_location_id": s, "skipGeometry": "true"})))
+    peaks = pd.concat(frames, ignore_index=True).drop(columns=["feature_id"], errors="ignore")
+    if "qualifier" in peaks.columns:
+        peaks["qualifier"] = peaks["qualifier"].map(to_list_str)
+    peaks.to_csv(out, index=False)
+    log.info("[5] %d peak records -> %s", len(peaks), out)
+
+
+# ----------------------------------------------------------------------------
+# STEP 6 - parish coverage summary
+# ----------------------------------------------------------------------------
+def step6_coverage(sites):
+    mpath = OUT_DIR / "continuous_manifest.csv"
+    if not mpath.exists():
+        log.info("[6] no continuous manifest yet - run step 3 first.")
+        return
+    man = pd.read_csv(mpath, dtype=str)
+    man = man[man.status == "ok"].merge(
+        sites[["monitoring_location_id", "parish_fips"]], on="monitoring_location_id", how="left")
+    cov = (man.pivot_table(index="parish_fips", columns="parameter_code",
+                           values="monitoring_location_id", aggfunc="nunique", fill_value=0)
+              .rename(columns={"00060": "n_discharge_gauges", "00065": "n_stage_gauges"}))
+    cov = cov.reindex(ALL_PARISH_FIPS, fill_value=0).rename_axis("parish_fips").reset_index()
+    for col in ("n_discharge_gauges", "n_stage_gauges"):
+        if col not in cov.columns:
+            cov[col] = 0
+    cov.to_csv(OUT_DIR / "parish_coverage.csv", index=False)
+    no_q = cov[cov["n_discharge_gauges"] == 0]
+    log.info("[6] %d of 64 parishes have NO continuous discharge gauge in %d: %s",
+             len(no_q), YEAR, ", ".join(no_q.parish_fips))
+    log.info("    (these are the parishes where NWM / GloFAS will be needed)")
+
+
+# ----------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--steps", nargs="*", type=int, default=[1, 2, 3, 4, 5, 6])
+    steps = set(ap.parse_args().steps)
+
+    if not API_KEY:
+        log.warning("No USGS_API_KEY set. Anonymous access is heavily rate-limited; "
+                    "get a free key at https://api.waterdata.usgs.gov/signup/")
+    log.info("Period (UTC, incl. padding): %s -> %s", START, END)
+
+    sites = step1_sites()                       # always needed downstream
+    ts = step2_timeseries(sites) if steps & {2, 3, 4, 5} else None
+    if 3 in steps:
+        step3_continuous(ts)
+    if 4 in steps:
+        step4_daily(sites, ts)
+    if 5 in steps:
+        step5_peaks(ts)
+    if 6 in steps:
+        step6_coverage(sites)
+    log.info("Finished. Output folder: %s", OUT_DIR)
+
+
+if __name__ == "__main__":
+    main()
