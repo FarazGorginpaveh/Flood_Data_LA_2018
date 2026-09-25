@@ -1,0 +1,536 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Sep 25 14:12:26 2026
+
+@author: mh01
+"""
+
+"""
+STEP 7 - Final parish (county) flood dataset for Louisiana, 2018
+================================================================
+Turns the reach/gauge events of step 5 into three tables, using the parish
+confidence levels of step 6:
+
+  parish_daily_2018.csv    64 parishes x 365 days  (one row per parish per day)
+  parish_events_2018.csv   one row per parish flood event (runs of flood days)
+  parish_annual_2018.csv   one row per parish: frequency, magnitude, duration,
+                           severity for the whole year (like the paper's county maps)
+
+Which data are used where
+  confidence high / medium -> NWM reaches
+  confidence low           -> USGS gauges in the parish if it has usable ones
+                              (not tidal, regulated or big-river), else NWM
+                              (still flagged low)
+  confidence unverified    -> no reliable data (flood_day left empty, not 0)
+  Both NWM and USGS columns are always kept, so you can change this rule later.
+
+Clean-up applied (version 2, after step 7b)
+  * data/diagnostics/reviewed_exclusions.csv : reaches/gauges removed
+    (coastal marsh, stuck lake reaches, pump-fed Bayou Lafourche, ...)
+  * USGS gauges that look tidal/regulated (canal, outlet, pump, GIWW, estuary
+    site types) are never used for local flooding
+  * Big-river flooding (Mississippi, Atchafalaya, lower Red) is reported in its
+    own column, big_river_flood_day, not mixed with local floods
+  * Events longer than LONG_EVENT_DAYS are flagged (long_event = True)
+
+Definitions (paper: Khajehei et al. 2020)
+  magnitude : peak_ratio = event peak / 2-yr flow (capped at 10); raw m3/s kept too
+  duration  : rise time (h) from threshold crossing to peak
+  severity  : severity_norm = peak_ratio / rise time (per hour)
+  frequency : number of parish flood events (and reach-events per 100 reaches)
+
+A parish FLOOD DAY = at least max(MIN_REACHES, MIN_FRAC x reaches) NWM reaches
+above their 2-yr flow on that local day (or >= 1 USGS gauge above its threshold
+when USGS is the source). Days within MERGE_DAYS of each other form one event.
+
+Inputs : data/events/*, data/evaluation/*, data/usgs/*
+Outputs: data/final/*  and  data/final/figures/fig9, fig10
+Usage  : python 07_parish_dataset.py
+"""
+
+import argparse
+import json
+import re
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.patches import Patch, Polygon
+
+# ----------------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------------
+PROJECT_DIR = Path(r"D:\Tufts\Wishlist\Sepideh_2")
+YEAR = 2018
+MIN_REACHES = 3          # parish flood day needs at least this many reaches ...
+MIN_FRAC = 0.01          # ... and at least this share of the parish's reaches
+MERGE_DAYS = 1           # flood days separated by <= 1 dry day = same event
+RATIO_CAP = 10           # cap peak/2-yr flow (tiny streams give huge ratios)
+INCLUDE_BIG_RIVERS = False   # Mississippi/Atchafalaya/lower Red: floods come from
+                             # upstream and are leveed -> reported separately
+MIN_PEAK_YEARS = 10
+LONG_EVENT_DAYS = 30     # parish events longer than this get long_event = True
+REGULATED_RE = re.compile(r"canal|outlet|pump|flood ?gate|cutoff|giww|lock|spillway|"
+                          r"control|diversion|channel|pass\b", re.I)
+BIG_RIVER_RE = re.compile(r"mississippi|atchafalaya|morgan city|wax lake", re.I)
+BIG_RIVER_SQMI = 10000
+FLOOD_STAGE_RE = re.compile(r"(?:national weather service|nws).*flood\s*stage", re.I)
+NOT_BASE_STAGE_RE = re.compile(r"moderate|major|discharge", re.I)
+ALL_PARISHES = [f"22{c:03d}" for c in range(1, 128, 2)]
+
+
+def set_paths(project_dir):
+    global USGS_DIR, EV_DIR, EVAL_DIR, DIAG_DIR, OUT_DIR, FIG_DIR
+    USGS_DIR = project_dir / "data" / "usgs"
+    EV_DIR = project_dir / "data" / "events"
+    EVAL_DIR = project_dir / "data" / "evaluation"
+    DIAG_DIR = project_dir / "data" / "diagnostics"
+    OUT_DIR = project_dir / "data" / "final"
+    FIG_DIR = OUT_DIR / "figures"
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ----------------------------------------------------------------------------
+# HELPERS
+# ----------------------------------------------------------------------------
+def load_parishes():
+    gj = json.loads((USGS_DIR / "la_parishes.geojson").read_text())
+    shapes, names, lat = {}, {}, {}
+    for f in gj["features"]:
+        g = f["geometry"]
+        polys = g["coordinates"] if g["type"] == "MultiPolygon" else [g["coordinates"]]
+        shapes[f["id"]] = [np.asarray(p[0]) for p in polys]
+        names[f["id"]] = f["properties"].get("NAME", f["id"])
+        lat[f["id"]] = max(shapes[f["id"]], key=len)[:, 1].mean()
+    return shapes, names, lat
+
+
+def draw_parishes(ax, shapes, values, cmap, vmin, vmax, label, fig):
+    cm = plt.get_cmap(cmap)
+    for fips, rings in shapes.items():
+        v = values.get(fips, np.nan)
+        fc = "#eeeeee" if pd.isna(v) else cm((v - vmin) / max(vmax - vmin, 1e-9))
+        for ring in rings:
+            ax.add_patch(Polygon(ring, closed=True, fc=fc, ec="white", lw=0.5))
+    ax.set_xlim(-94.1, -88.8)
+    ax.set_ylim(28.9, 33.1)
+    ax.set_aspect(1.15)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    sm = plt.cm.ScalarMappable(cmap=cm, norm=plt.Normalize(vmin, vmax))
+    fig.colorbar(sm, ax=ax, shrink=0.65, label=label)
+
+
+def expand_days(ev, id_col):
+    """One row per (event, local day) the event covers, clipped to YEAR."""
+    ev = ev.reset_index(drop=True)
+    s = pd.to_datetime(ev["start_date_local"]).clip(lower=pd.Timestamp(f"{YEAR}-01-01"))
+    e = pd.to_datetime(ev["end_date_local"]).clip(upper=pd.Timestamp(f"{YEAR}-12-31"))
+    n = ((e - s).dt.days + 1).clip(lower=0)
+    rep = ev.loc[ev.index.repeat(n), [id_col, "parish_fips"]].copy()
+    offs = np.concatenate([np.arange(k) for k in n]) if len(n) else np.array([], int)
+    rep["date"] = np.repeat(s.to_numpy(), n) + pd.to_timedelta(offs, unit="D")
+    return rep
+
+
+def runs_to_events(days, merge_days):
+    """Group sorted flood dates into events; returns list of (start, end)."""
+    if len(days) == 0:
+        return []
+    days = pd.to_datetime(sorted(days))
+    out, s, prev = [], days[0], days[0]
+    for d in days[1:]:
+        if (d - prev).days <= merge_days + 1:
+            prev = d
+        else:
+            out.append((s, prev))
+            s, prev = d, d
+    out.append((s, prev))
+    return out
+
+
+def load_exclusions():
+    """Reviewed exclusions from step 7b -> (reaches to drop, gauges to drop, big-river gauges)."""
+    path = DIAG_DIR / "reviewed_exclusions.csv"
+    if not path.exists():
+        print(f"  ! {path.name} not found - running WITHOUT reach/gauge exclusions")
+        return set(), set(), set()
+    ex = pd.read_csv(path, dtype={"id": str, "parish_fips": str})
+    ex["decision"] = ex.get("decision", "exclude").fillna("exclude")
+    reaches = set(ex.loc[(ex.type == "nwm_reach") & (ex.decision == "exclude"), "id"]
+                  .astype(float).astype("int64"))
+    g = ex[ex.type == "usgs_gauge"]
+    drop = set(g.loc[g.decision == "exclude", "id"])
+    big = set(g.loc[g.decision.str.contains("big", case=False), "id"])
+    print(f"  exclusions: {len(reaches)} NWM reaches, {len(drop)} USGS gauges dropped, "
+          f"{len(big)} USGS gauges moved to big-river category")
+    return reaches, drop, big
+
+
+def classify_gauges(gids):
+    """Automatic rule: gauge id 'USGS-xxx_pc' -> 'local' / 'regulated' / 'big_river'."""
+    sites = pd.read_csv(USGS_DIR / "sites_LA.csv", dtype=str).set_index("monitoring_location_id")
+    out = {}
+    for gid in gids:
+        site = gid.rsplit("_", 1)[0]
+        name = str(sites["monitoring_location_name"].get(site, ""))
+        stype = str(sites["site_type_code"].get(site, ""))
+        da = pd.to_numeric(sites["drainage_area"].get(site, np.nan), errors="coerce")
+        if BIG_RIVER_RE.search(name) or (pd.notna(da) and da > BIG_RIVER_SQMI):
+            out[gid] = "big_river"
+        elif REGULATED_RE.search(name) or stype in ("ES", "ST-TS", "ST-CA", "ST-DCH"):
+            out[gid] = "regulated"
+        else:
+            out[gid] = "local"
+    return out
+
+
+# ----------------------------------------------------------------------------
+# NWM parish-day table
+# ----------------------------------------------------------------------------
+def nwm_daily(dates, excl_reaches):
+    flags = pd.read_csv(EVAL_DIR / "reach_flags_2018.csv", dtype={"parish_fips": str})
+    flags = flags[~flags.feature_id.isin(excl_reaches)]
+    use = flags[flags.use_reach & (INCLUDE_BIG_RIVERS | ~flags.big_river)]
+    n_reaches = use.groupby("parish_fips").size().rename("nwm_n_reaches")
+
+    ev = pd.read_parquet(EV_DIR / "events_nwm_2018.parquet")
+    ev["parish_fips"] = ev["parish_fips"].astype(str)
+    big_ev = ev[ev.feature_id.isin(flags.loc[flags.big_river, "feature_id"])]
+    ev = ev[ev.feature_id.isin(use.feature_id)].copy()
+    ev["peak_ratio_c"] = ev["peak_ratio"].clip(upper=RATIO_CAP)
+    ev["severity_norm_c"] = ev["peak_ratio_c"] / ev["rise_time_h"]
+    ev["peak_date"] = pd.to_datetime(ev["peak_date_local"])
+    ev["start_date"] = pd.to_datetime(ev["start_date_local"])
+    ev["event_uid"] = np.arange(len(ev))
+
+    # reaches above threshold on each day (the spatial extent of flooding)
+    rd = expand_days(ev.assign(fid=ev.feature_id), "fid")
+    ext = rd.groupby(["parish_fips", "date"])["fid"].nunique().rename("nwm_reaches_flooding")
+
+    # event metrics on the day the events PEAK
+    pk = ev.groupby(["parish_fips", "peak_date"]).agg(
+        nwm_events_peaking=("event_uid", "size"),
+        nwm_max_peak_ratio=("peak_ratio_c", "max"),
+        nwm_median_peak_ratio=("peak_ratio_c", "median"),
+        nwm_max_peak_cms=("peak", "max"),
+        nwm_median_rise_h=("rise_time_h", "median"),
+        nwm_max_rise_h=("rise_time_h", "max"),
+        nwm_max_severity_norm=("severity_norm_c", "max"),
+        nwm_median_severity_norm=("severity_norm_c", "median"),
+        nwm_max_severity_cms_h=("severity", "max"),
+    ).rename_axis(["parish_fips", "date"])
+    st = ev.groupby(["parish_fips", "start_date"]).size().rename("nwm_events_starting") \
+        .rename_axis(["parish_fips", "date"])
+
+    big = expand_days(big_ev.assign(fid=big_ev.feature_id), "fid") if len(big_ev) else \
+        pd.DataFrame(columns=["parish_fips", "date", "fid"])
+    bigd = big.groupby(["parish_fips", "date"])["fid"].nunique().rename("big_river_reaches_flooding")
+
+    idx = pd.MultiIndex.from_product([ALL_PARISHES, dates], names=["parish_fips", "date"])
+    d = pd.DataFrame(index=idx).join([ext, pk, st, bigd]).reset_index()
+    for c in ("nwm_reaches_flooding", "nwm_events_peaking", "nwm_events_starting",
+              "big_river_reaches_flooding"):
+        d[c] = d[c].fillna(0).astype(int)
+    d = d.merge(n_reaches, on="parish_fips", how="left")
+    d["nwm_n_reaches"] = d["nwm_n_reaches"].fillna(0).astype(int)
+    d["nwm_frac_flooding"] = d.nwm_reaches_flooding / d.nwm_n_reaches.replace(0, np.nan)
+    need = np.maximum(MIN_REACHES, np.ceil(MIN_FRAC * d.nwm_n_reaches))
+    d["nwm_flood_day"] = d.nwm_reaches_flooding >= need
+    return d, ev
+
+
+# ----------------------------------------------------------------------------
+# USGS parish-day table
+# ----------------------------------------------------------------------------
+def usgs_evaluated_gauges():
+    """Gauges that had a 2018 record AND a threshold (same rules as step 5)."""
+    cont = USGS_DIR / "continuous"
+    files = list(cont.glob("USGS-*_*.*")) if cont.exists() else []
+    pk = pd.read_csv(USGS_DIR / "annual_peaks_LA.csv", dtype=str)
+    pk = pk[pk.parameter_code == "00060"]
+    q2_ok = set(pk.groupby("monitoring_location_id")["water_year"].nunique()
+                .loc[lambda s: s >= MIN_PEAK_YEARS].index)
+    th = pd.read_csv(USGS_DIR / "thresholds_LA.csv", dtype=str)
+    fs_ok = set(th[th.threshold_name.fillna("").str.contains(FLOOD_STAGE_RE)
+                   & ~th.threshold_name.fillna("").str.contains(NOT_BASE_STAGE_RE)
+                   & (th.parameter_code == "00065")].monitoring_location_id)
+    rows = []
+    for f in files:
+        site, pc = f.name.split(".")[0].rsplit("_", 1)
+        if (pc == "00060" and site in q2_ok) or (pc == "00065" and site in fs_ok):
+            rows.append((site, pc))
+    g = pd.DataFrame(rows, columns=["monitoring_location_id", "parameter_code"])
+    sites = pd.read_csv(USGS_DIR / "sites_LA.csv", dtype=str)[["monitoring_location_id", "parish_fips"]]
+    return g.merge(sites, on="monitoring_location_id", how="left")
+
+
+def usgs_daily(dates, drop_gauges, big_gauges):
+    gauges = usgs_evaluated_gauges()
+    gauges["gid"] = gauges.monitoring_location_id + "_" + gauges.parameter_code
+    cls = classify_gauges(gauges.gid)
+    gauges["kind"] = gauges.gid.map(cls)
+    gauges.loc[gauges.gid.isin(big_gauges), "kind"] = "big_river"
+    gauges.loc[gauges.gid.isin(drop_gauges), "kind"] = "excluded"
+    local_ids = set(gauges.loc[gauges.kind == "local", "gid"])
+    big_ids = set(gauges.loc[gauges.kind == "big_river", "gid"])
+    print(f"  USGS gauges with thresholds: {len(gauges)} -> local {len(local_ids)}, "
+          f"big-river {len(big_ids)}, regulated/tidal {int((gauges.kind == 'regulated').sum())}, "
+          f"excluded {int((gauges.kind == 'excluded').sum())}")
+    n_g = (gauges[gauges.kind == "local"].groupby("parish_fips")["monitoring_location_id"]
+           .nunique().rename("usgs_n_gauges"))
+    idx = pd.MultiIndex.from_product([ALL_PARISHES, dates], names=["parish_fips", "date"])
+    path = EV_DIR / "events_usgs_2018.parquet"
+    ev = pd.read_parquet(path) if path.exists() else pd.DataFrame()
+    if ev.empty:
+        d = pd.DataFrame(index=idx).reset_index()
+        d["usgs_gauges_flooding"] = 0
+        d["usgs_big_river_gauges_flooding"] = 0
+    else:
+        ev["parish_fips"] = ev["parish_fips"].astype(str)
+        ev["peak_date"] = pd.to_datetime(ev["peak_date_local"])
+        ev["gid"] = ev.monitoring_location_id + "_" + ev.parameter_code
+        ev_big = ev[ev.gid.isin(big_ids)]
+        ev = ev[ev.gid.isin(local_ids)]
+        bd = expand_days(ev_big, "gid") if len(ev_big) else pd.DataFrame(
+            columns=["gid", "parish_fips", "date"])
+        big = bd.groupby(["parish_fips", "date"])["gid"].nunique().rename(
+            "usgs_big_river_gauges_flooding")
+        gd = expand_days(ev, "gid")
+        ext = gd.groupby(["parish_fips", "date"])["gid"].nunique().rename("usgs_gauges_flooding")
+        q = ev[ev.parameter_code == "00060"].copy()
+        q["peak_ratio_c"] = q["peak_ratio"].clip(upper=RATIO_CAP)
+        q["severity_norm_c"] = q["peak_ratio_c"] / q["rise_time_h"]
+        pq = q.groupby(["parish_fips", "peak_date"]).agg(
+            usgs_events_peaking=("gid", "size"),
+            usgs_max_peak_ratio=("peak_ratio_c", "max"),
+            usgs_median_rise_h=("rise_time_h", "median"),
+            usgs_max_severity_norm=("severity_norm_c", "max"),
+        ).rename_axis(["parish_fips", "date"])
+        h = ev[ev.parameter_code == "00065"]
+        ph = h.groupby(["parish_fips", "peak_date"]).agg(
+            usgs_stage_events_peaking=("gid", "size"),
+            usgs_max_stage_above_flood_ft=("peak_excess", "max"),
+        ).rename_axis(["parish_fips", "date"])
+        d = pd.DataFrame(index=idx).join([ext, pq, ph, big]).reset_index()
+        for c in ("usgs_gauges_flooding", "usgs_events_peaking", "usgs_stage_events_peaking",
+                  "usgs_big_river_gauges_flooding"):
+            d[c] = d[c].fillna(0).astype(int)
+    d = d.merge(n_g, on="parish_fips", how="left")
+    d["usgs_n_gauges"] = d["usgs_n_gauges"].fillna(0).astype(int)
+    d["usgs_flood_day"] = d["usgs_gauges_flooding"] >= 1
+    return d, ev
+
+
+# ----------------------------------------------------------------------------
+# MAIN BUILD
+# ----------------------------------------------------------------------------
+def build():
+    shapes, names, lat = load_parishes()
+    dates = pd.date_range(f"{YEAR}-01-01", f"{YEAR}-12-31", freq="D")
+    conf = pd.read_csv(EVAL_DIR / "parish_confidence_2018.csv", dtype={"parish_fips": str})
+
+    excl_reaches, drop_gauges, big_gauges = load_exclusions()
+    dn, ev_nwm = nwm_daily(dates, excl_reaches)
+    du, ev_usgs = usgs_daily(dates, drop_gauges, big_gauges)
+    d = dn.merge(du, on=["parish_fips", "date"], how="left")
+    d = d.merge(conf[["parish_fips", "confidence"]], on="parish_fips", how="left")
+    d["confidence"] = d["confidence"].fillna("unverified")
+    d.insert(1, "parish_name", d.parish_fips.map(names))
+
+    # ---- choose the source per parish ---------------------------------------
+    use_usgs = (d.confidence == "low") & (d.usgs_n_gauges > 0)
+    no_data = d.confidence == "unverified"
+    d["source"] = np.select([no_data, use_usgs], ["none", "USGS"], "NWM")
+
+    def pick(usgs_col, nwm_col, fill=np.nan):
+        u = d[usgs_col] if usgs_col in d else pd.Series(fill, index=d.index)
+        return np.where(no_data, np.nan, np.where(use_usgs, u, d[nwm_col]))
+
+    d["flood_day"] = pd.array(np.where(use_usgs, d.usgs_flood_day, d.nwm_flood_day),
+                              dtype="boolean")
+    d.loc[no_data, "flood_day"] = pd.NA
+    d["magnitude_peak_ratio"] = pick("usgs_max_peak_ratio", "nwm_max_peak_ratio")
+    d["duration_rise_h"] = pick("usgs_median_rise_h", "nwm_median_rise_h")
+    d["severity_norm"] = pick("usgs_max_severity_norm", "nwm_max_severity_norm")
+    d["events_peaking"] = pick("usgs_events_peaking", "nwm_events_peaking", 0)
+    d["big_river_flood_day"] = (d.big_river_reaches_flooding > 0) | \
+        (d.get("usgs_big_river_gauges_flooding", 0) > 0)
+    lead = ["parish_fips", "parish_name", "date", "confidence", "source", "flood_day",
+            "magnitude_peak_ratio", "duration_rise_h", "severity_norm", "events_peaking",
+            "big_river_flood_day"]
+    d = d[lead + [c for c in d.columns if c not in lead]]
+    d.to_csv(OUT_DIR / "parish_daily_2018.csv", index=False)
+
+    # ---- parish events --------------------------------------------------------
+    ev_rows = []
+    for fips, g in d.groupby("parish_fips"):
+        if (g.source == "none").all():
+            continue
+        fdays = g.loc[g.flood_day.fillna(False).astype(bool), "date"]
+        for k, (s, e) in enumerate(runs_to_events(fdays, MERGE_DAYS), 1):
+            w = g[(g.date >= s) & (g.date <= e)]
+            src = w.source.iloc[0]
+            ext_col = "usgs_gauges_flooding" if src == "USGS" else "nwm_reaches_flooding"
+            peak_day = w.loc[w[ext_col].idxmax(), "date"]
+            if src == "NWM":
+                sub = ev_nwm[(ev_nwm.parish_fips == fips) & ev_nwm.peak_date.between(s, e)]
+                mag, rise = sub.peak_ratio_c, sub.rise_time_h
+                sev, raw = sub.severity_norm_c, sub.peak
+            else:
+                sub = ev_usgs[(ev_usgs.parish_fips == fips) & ev_usgs.peak_date.between(s, e)
+                              & (ev_usgs.parameter_code == "00060")] if len(ev_usgs) else pd.DataFrame()
+                mag = sub.get("peak_ratio", pd.Series(dtype=float)).clip(upper=RATIO_CAP)
+                rise = sub.get("rise_time_h", pd.Series(dtype=float))
+                sev = mag / rise if len(sub) else pd.Series(dtype=float)
+                raw = sub.get("peak", pd.Series(dtype=float))
+            ev_rows.append({
+                "parish_fips": fips, "parish_name": names.get(fips, fips),
+                "event_id": f"{fips}_{YEAR}_{k:02d}", "start_date": s.date(), "end_date": e.date(),
+                "peak_day": peak_day.date(), "n_flood_days": int(w.flood_day.fillna(False).sum()),
+                "length_days": (e - s).days + 1,
+                "max_extent": int(w[ext_col].max()),
+                "max_frac_reaches": w.nwm_frac_flooding.max() if src == "NWM" else np.nan,
+                "n_reach_or_gauge_events": len(sub),
+                "magnitude_max_peak_ratio": mag.max() if len(mag) else np.nan,
+                "magnitude_max_peak_cms": raw.max() if len(raw) else np.nan,
+                "duration_median_rise_h": rise.median() if len(rise) else np.nan,
+                "duration_max_rise_h": rise.max() if len(rise) else np.nan,
+                "severity_max_norm": sev.max() if len(sev) else np.nan,
+                "severity_median_norm": sev.median() if len(sev) else np.nan,
+                "big_river_days": int(w.big_river_flood_day.sum()),
+                "long_event": (e - s).days + 1 > LONG_EVENT_DAYS,
+                "source": src, "confidence": w.confidence.iloc[0]})
+    pe = pd.DataFrame(ev_rows)
+    pe.to_csv(OUT_DIR / "parish_events_2018.csv", index=False)
+
+    # ---- parish annual summary -----------------------------------------------
+    flags = pd.read_csv(EVAL_DIR / "reach_flags_2018.csv", dtype={"parish_fips": str})
+    flags = flags[~flags.feature_id.isin(excl_reaches)]
+    use = flags[flags.use_reach & (INCLUDE_BIG_RIVERS | ~flags.big_river)]
+    ann = pd.DataFrame({"parish_fips": ALL_PARISHES})
+    ann["parish_name"] = ann.parish_fips.map(names)
+    ann = ann.merge(conf[["parish_fips", "confidence"]], on="parish_fips", how="left")
+    ann["source"] = ann.parish_fips.map(d.groupby("parish_fips").source.first())
+    if len(pe):
+        g = pe.groupby("parish_fips")
+        ann = ann.merge(pd.DataFrame({
+            "frequency_events": g.size(),
+            "flood_days": g.n_flood_days.sum(),
+            "magnitude_mean_peak_ratio": g.magnitude_max_peak_ratio.mean(),
+            "magnitude_max_peak_ratio": g.magnitude_max_peak_ratio.max(),
+            "duration_median_rise_h": g.duration_median_rise_h.median(),
+            "severity_mean_norm": g.severity_max_norm.mean(),
+            "severity_max_norm": g.severity_max_norm.max(),
+            "n_long_events": g.long_event.sum(),
+        }).reset_index(), on="parish_fips", how="left")
+    for c in ("frequency_events", "flood_days", "n_long_events"):
+        if c not in ann:
+            ann[c] = 0
+        ann[c] = ann[c].fillna(0).astype(int)
+    ann["big_river_flood_days"] = ann.parish_fips.map(d.groupby("parish_fips").big_river_flood_day.sum())
+    nod = ann.source == "none"
+    ann.loc[nod, ["frequency_events", "flood_days", "n_long_events"]] = np.nan
+    re_n = ev_nwm.groupby("parish_fips").size()
+    ann["nwm_reach_events_per_100_reaches"] = (100 * ann.parish_fips.map(re_n).fillna(0)
+                                               / ann.parish_fips.map(use.groupby("parish_fips").size()))
+    ann["nwm_share_reaches_flooded"] = ann.parish_fips.map(
+        use.assign(f=use.n_events > 0).groupby("parish_fips").f.mean())
+    ann.to_csv(OUT_DIR / "parish_annual_2018.csv", index=False)
+
+    figures(d, ann, shapes, lat)
+
+    # ---- summary --------------------------------------------------------------
+    print(f"parish_daily_2018.csv : {len(d):,} rows ({d.parish_fips.nunique()} parishes x {len(dates)} days)")
+    print(f"   flood days          : {int(d.flood_day.sum()):,} parish-days "
+          f"({d.flood_day.mean():.1%} of days with data)")
+    print(f"   big-river flood days: {int(d.big_river_flood_day.sum()):,} parish-days (separate)")
+    print(f"   source              : " + ", ".join(f"{k} {v // len(dates)} parishes"
+                                                  for k, v in d.source.value_counts().items()))
+    print(f"parish_events_2018.csv: {len(pe):,} parish flood events")
+    if len(pe):
+        print(f"   per parish          : median {ann.frequency_events.median():.0f}, "
+              f"max {ann.frequency_events.max()} ({ann.loc[ann.frequency_events.idxmax(), 'parish_name']})")
+        print(f"   median event length : {pe.length_days.median():.0f} days, "
+              f"median rise time {pe.duration_median_rise_h.median():.0f} h")
+        print(f"   long events (> {LONG_EVENT_DAYS} d): {int(pe.long_event.sum())} "
+              + (f"({', '.join(pe.loc[pe.long_event, 'parish_name'])})" if pe.long_event.any() else ""))
+    print(f"parish_annual_2018.csv: {len(ann)} parishes")
+    print(f"Outputs in {OUT_DIR}")
+
+
+# ----------------------------------------------------------------------------
+# FIGURES
+# ----------------------------------------------------------------------------
+def figures(d, ann, shapes, lat):
+    a = ann.set_index("parish_fips")
+    fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+    panels = [
+        ("frequency_events", "A. Frequency: flood events in 2018", "Events", "Blues"),
+        ("magnitude_mean_peak_ratio", "B. Magnitude: mean event peak / 2-yr flow", "Ratio", "Oranges"),
+        ("duration_median_rise_h", "C. Duration: median rise time", "Hours", "Greens"),
+        ("severity_mean_norm", "D. Severity: mean (peak ratio / rise time)", "per hour", "Reds"),
+    ]
+    for ax, (col, title, lab, cmap) in zip(axes.ravel(), panels):
+        v = a[col] if col in a else pd.Series(dtype=float)
+        vals = v.dropna()
+        vmin, vmax = (vals.min(), vals.quantile(0.95)) if len(vals) else (0, 1)
+        draw_parishes(ax, shapes, v.to_dict(), cmap, vmin, max(vmax, vmin + 1e-6), lab, fig)
+        low = a.index[a.confidence.isin(["low", "unverified"])]
+        for f in low:
+            for ring in shapes.get(f, []):
+                ax.add_patch(Polygon(ring, closed=True, fc="none", ec="k", lw=0.6, hatch="///"))
+        ax.set_title(title)
+    axes[1, 1].legend(handles=[Patch(fc="white", ec="k", hatch="///",
+                                     label="low / unverified confidence")],
+                      loc="lower left", fontsize=8)
+    fig.suptitle(f"Louisiana parish flood characteristics, {YEAR}", fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(FIG_DIR / "fig9_parish_maps_2018.png", dpi=160)
+    plt.close(fig)
+
+    # calendar: parishes (north -> south) x days
+    order = sorted(ALL_PARISHES, key=lambda f: -lat.get(f, 0))
+    mat = (d.assign(v=np.select([d.source == "NWM", d.source == "USGS"],
+                                [d.nwm_frac_flooding, np.minimum(d.usgs_gauges_flooding, 1)],
+                                np.nan))
+           .pivot(index="parish_fips", columns="date", values="v").reindex(order))
+    fl = d.assign(f=d.flood_day.fillna(False).astype(bool)).pivot(
+        index="parish_fips", columns="date", values="f").reindex(order)
+    fig, ax = plt.subplots(figsize=(16, 12))
+    cmap_b = plt.get_cmap("Blues").copy()
+    cmap_b.set_bad("#bbbbbb")
+    im = ax.imshow(np.ma.masked_invalid(np.sqrt(mat.to_numpy(float))), aspect="auto",
+                   cmap=cmap_b, interpolation="nearest")
+    flood = np.ma.masked_where(~fl.fillna(False).to_numpy(bool), np.ones(fl.shape))
+    ax.imshow(flood, aspect="auto", cmap="autumn", alpha=0.55, interpolation="nearest")
+    ax.scatter([], [], s=40, c="#ff0000", marker="s", alpha=0.55, label="parish flood day")
+    names = d.drop_duplicates("parish_fips").set_index("parish_fips").parish_name
+    ax.set_yticks(range(len(order)))
+    ax.set_yticklabels([f"{names.get(f, f)} ({d.loc[d.parish_fips == f, 'confidence'].iloc[0][0].upper()})"
+                        for f in order], fontsize=6)
+    months = pd.date_range(f"{YEAR}-01-01", periods=12, freq="MS")
+    ax.set_xticks([(m - months[0]).days for m in months])
+    ax.set_xticklabels(months.strftime("%b"))
+    cb = fig.colorbar(im, ax=ax, shrink=0.5)
+    cb.set_label("share of parish reaches above 2-yr flow (sqrt scale)")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title(f"Daily flooding by parish, {YEAR} (north at top; H/M/L/U = confidence;"
+                 " grey = no reliable data; USGS parishes = gauge flooding yes/no)",
+                 fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(FIG_DIR / "fig10_parish_calendar_2018.png", dpi=160)
+    plt.close(fig)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project-dir", default=str(PROJECT_DIR))
+    args = ap.parse_args()
+    set_paths(Path(args.project_dir))
+    build()
+
+
+if __name__ == "__main__":
+    main()
