@@ -1,0 +1,502 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Sep 25 11:18:42 2026
+
+@author: mh01
+"""
+
+"""
+STEP 3 - Download NOAA National Water Model (NWM) v3.0 retrospective streamflow
+===============================================================================
+Goal : give EVERY Louisiana parish streamflow data (USGS covers only 41 of 64),
+       so flood frequency / magnitude / duration / severity can be computed per
+       parish and per day.
+
+Data : NWM v3.0 retrospective, CONUS, hourly streamflow (m3/s) for ~2.7 million
+       NHDPlus v2 river reaches, Feb 1979 - Jan 2023.
+       Public, no account needed: s3://noaa-nwm-retrospective-3-0-pds/CONUS/zarr/chrtout.zarr
+       NOTE: the retrospective run has NO data assimilation -> check it against USGS.
+
+What it creates (in D:\\Tufts\\Wishlist\\Sepideh_2\\data\\nwm)
+-------------------------------------------------------------
+  0. (printed)                       download plan: how many GB each step will read
+  1. reaches_LA.csv                  every NWM reach in Louisiana with its parish,
+                                     stream order and USGS gage ID (if any)
+  2. nwm_LA_hourly_2018.zarr         hourly flow for all LA reaches,
+                                     1 Dec 2017 - 31 Jan 2019 (UTC), padded like USGS
+  3. annual_max_LA.parquet           annual (water-year) maximum flow per reach,
+                                     WY1980-WY2022 -> used for flood thresholds
+     reach_thresholds_LA.csv         per reach: 2-yr flow (median of annual maxima)
+                                     and Gumbel 2/5/10/25-yr flows
+  4. usgs_nwm_crosswalk_LA.csv       NWM reach <-> USGS gauge
+     figures/fig5_nwm_reaches.png    reaches per parish + 2-yr flow map
+     figures/fig6_nwm_vs_usgs_2018.png   NWM vs USGS hydrographs, 2018
+
+Size   : step 2 is a few GB to read; step 3 reads all 43 years and is the big one
+         (can be 100+ GB of reading, run it overnight; it is resumable per year).
+         Run  "python 03_download_nwm_retrospective.py --plan-only"  first.
+
+Install: pip install "xarray[io]" zarr s3fs fsspec dask pandas pyarrow matplotlib
+Usage  : python 03_download_nwm_retrospective.py              (steps 1-4)
+         python 03_download_nwm_retrospective.py --steps 1 2   (only some steps)
+         python 03_download_nwm_retrospective.py --plan-only   (just show sizes)
+"""
+
+import argparse
+import json
+import logging
+import math
+import time
+from pathlib import Path
+
+import dask
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+import xarray as xr
+from dask.diagnostics import ProgressBar
+from matplotlib.colors import LogNorm
+from matplotlib.path import Path as MplPath
+from matplotlib.patches import Polygon
+
+# ----------------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------------
+PROJECT_DIR = Path(r"D:\Tufts\Wishlist\Sepideh_2")
+STORE = "s3://noaa-nwm-retrospective-3-0-pds/CONUS/zarr/chrtout.zarr"
+
+START = "2017-12-01T00:00"      # same padded window as the USGS download
+END = "2019-01-31T23:00"
+WY_START, WY_END = 1980, 2022   # complete water years in the retrospective
+MIN_ORDER = 1                   # 1 = keep all reaches; 2 or 3 drops tiny headwater streams
+N_WORKERS = 16                  # parallel downloads (I/O bound, more threads = faster)
+LA_BBOX = (-94.10, 28.80, -88.70, 33.10)
+PARISH_GEOJSON_URL = ("https://raw.githubusercontent.com/plotly/datasets/master/"
+                      "geojson-counties-fips.json")
+CFS_TO_CMS = 0.0283168
+
+
+def set_paths(project_dir):
+    global USGS_DIR, NWM_DIR, FIG_DIR
+    USGS_DIR = project_dir / "data" / "usgs"
+    NWM_DIR = project_dir / "data" / "nwm"
+    FIG_DIR = NWM_DIR / "figures"
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+log = logging.getLogger("nwm")
+
+
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-7s | %(message)s",
+        handlers=[logging.FileHandler(NWM_DIR / "download_log.txt", encoding="utf-8"),
+                  logging.StreamHandler()],
+    )
+
+
+# ----------------------------------------------------------------------------
+# HELPERS
+# ----------------------------------------------------------------------------
+def open_store(store):
+    """Open the NWM chrtout Zarr store lazily (nothing is downloaded yet)."""
+    kw = {"storage_options": {"anon": True}} if store.startswith("s3://") else {}
+    try:
+        ds = xr.open_zarr(store, consolidated=True, **kw)
+    except Exception:
+        ds = xr.open_zarr(store, consolidated=False, **kw)
+    log.info("Opened %s : %d reaches, %s -> %s", store, ds.sizes["feature_id"],
+             str(ds.time.values[0])[:16], str(ds.time.values[-1])[:16])
+    return ds
+
+
+def load_parishes():
+    """Parish outlines {fips: [ring arrays]} and names. Re-uses the file from step 02."""
+    cache = USGS_DIR / "la_parishes.geojson"
+    if not cache.exists():
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        gj = requests.get(PARISH_GEOJSON_URL, timeout=120).json()
+        gj["features"] = [f for f in gj["features"] if f["id"].startswith("22")]
+        cache.write_text(json.dumps(gj))
+    gj = json.loads(cache.read_text())
+    shapes, names = {}, {}
+    for f in gj["features"]:
+        g = f["geometry"]
+        polys = g["coordinates"] if g["type"] == "MultiPolygon" else [g["coordinates"]]
+        shapes[f["id"]] = [np.asarray(p[0]) for p in polys]
+        names[f["id"]] = f["properties"].get("NAME", f["id"])
+    return shapes, names
+
+
+def assign_parish(lon, lat, shapes):
+    """Point-in-polygon: parish FIPS for each point ('' if outside Louisiana)."""
+    pts = np.column_stack([lon, lat])
+    out = np.full(len(pts), "", dtype=object)
+    for fips, rings in shapes.items():
+        for ring in rings:
+            inside = MplPath(ring).contains_points(pts) & (out == "")
+            out[inside] = fips
+    return out
+
+
+def decode_str(arr):
+    return np.array([(x.decode() if isinstance(x, bytes) else str(x)).strip() for x in arr])
+
+
+def dim_chunks(da):
+    """Chunk size per dimension of the (remote) array."""
+    ch = da.encoding.get("chunks") or da.encoding.get("preferred_chunks")
+    if isinstance(ch, dict):
+        return ch
+    if ch is None:
+        ch = [c[0] for c in da.chunks]
+    return dict(zip(da.dims, ch))
+
+
+def selected_indices(reaches):
+    return np.sort(reaches["zarr_index"].to_numpy().astype(np.int64))
+
+
+# ----------------------------------------------------------------------------
+# STEP 1 - Louisiana reaches
+# ----------------------------------------------------------------------------
+def step1_reaches(ds):
+    out = NWM_DIR / "reaches_LA.csv"
+    if out.exists():
+        log.info("[1] reaches_LA.csv exists - loading.")
+        return pd.read_csv(out, dtype={"parish_fips": str, "gage_id": str})
+
+    log.info("[1] Reading reach coordinates (~2.7M reaches, small arrays) ...")
+    fid = ds["feature_id"].values
+    lat = ds["latitude"].values.astype("float64")
+    lon = ds["longitude"].values.astype("float64")
+    box = (lon >= LA_BBOX[0]) & (lon <= LA_BBOX[2]) & (lat >= LA_BBOX[1]) & (lat <= LA_BBOX[3])
+    idx = np.where(box)[0]
+    log.info("    %d reaches inside the bbox; assigning parishes ...", len(idx))
+
+    shapes, names = load_parishes()
+    parish = assign_parish(lon[idx], lat[idx], shapes)
+    keep = parish != ""
+    idx, parish = idx[keep], parish[keep]
+
+    df = pd.DataFrame({"feature_id": fid[idx], "zarr_index": idx,
+                       "lat": lat[idx], "lon": lon[idx], "parish_fips": parish})
+    df["parish_name"] = df["parish_fips"].map(names)
+    for var in ("order", "elevation"):
+        if var in ds.variables:
+            df[var] = ds[var].isel(feature_id=idx).values
+    if "gage_id" in ds.variables:
+        df["gage_id"] = decode_str(ds["gage_id"].isel(feature_id=idx).values)
+        df.loc[df["gage_id"].isin(["", "nan", "None"]), "gage_id"] = ""
+
+    n_all = len(df)
+    if "order" in df.columns and MIN_ORDER > 1:
+        df = df[df["order"] >= MIN_ORDER]
+        log.info("    kept %d of %d reaches with stream order >= %d", len(df), n_all, MIN_ORDER)
+    df.to_csv(out, index=False)
+
+    per = df.groupby("parish_fips").size()
+    log.info("[1] %d Louisiana reaches saved -> %s", len(df), out)
+    log.info("    parishes covered: %d of 64 (min %d, median %d reaches per parish)",
+             per.size, per.min(), int(per.median()))
+    return pd.read_csv(out, dtype={"parish_fips": str, "gage_id": str})
+
+
+# ----------------------------------------------------------------------------
+# STEP 0 - download plan
+# ----------------------------------------------------------------------------
+def plan(ds, reaches, store):
+    sf = ds["streamflow"]
+    ch = dim_chunks(sf)
+    ct, cf = int(ch["time"]), int(ch["feature_id"])
+    idx = selected_indices(reaches)
+    feat_chunks = np.unique(idx // cf)
+
+    times = ds["time"].to_index()
+    def n_time_chunks(t0, t1):
+        i0, i1 = times.searchsorted(pd.Timestamp(t0)), times.searchsorted(pd.Timestamp(t1))
+        return len(range(i0 // ct, i1 // ct + 1))
+
+    # estimate compressed size of one chunk by asking S3 for a few object sizes
+    mb_per_chunk = None
+    if store.startswith("s3://"):
+        try:
+            import s3fs
+            fs = s3fs.S3FileSystem(anon=True)
+            tpos = sf.dims.index("time")
+            sizes = []
+            for fc in feat_chunks[:3]:
+                key = [0, 0]
+                key[tpos], key[1 - tpos] = 100, int(fc)
+                for k in (f"{store}/streamflow/{key[0]}.{key[1]}",
+                          f"{store}/streamflow/c/{key[0]}/{key[1]}"):
+                    try:
+                        sizes.append(fs.size(k))
+                        break
+                    except Exception:
+                        continue
+            if sizes:
+                mb_per_chunk = np.mean(sizes) / 1e6
+        except Exception as exc:
+            log.info("    (could not read chunk sizes: %s)", exc)
+    if mb_per_chunk is None:
+        mb_per_chunk = ct * cf * 4 / 1e6 * 0.3   # rough guess: 30% of raw float32
+
+    n2 = n_time_chunks(START, END) * len(feat_chunks)
+    n3 = n_time_chunks(f"{WY_START - 1}-10-01", f"{WY_END}-09-30") * len(feat_chunks)
+    log.info("[0] DOWNLOAD PLAN")
+    log.info("    chunk shape: %d hours x %d reaches (~%.0f MB each, compressed)",
+             ct, cf, mb_per_chunk)
+    log.info("    Louisiana reaches: %d, spread over %d of %d reach-chunks",
+             len(idx), len(feat_chunks), math.ceil(ds.sizes["feature_id"] / cf))
+    log.info("    step 2 (hourly 2018)        : %5d chunks  ~ %6.1f GB to read", n2,
+             n2 * mb_per_chunk / 1e3)
+    log.info("    step 3 (annual max WY%d-%d): %5d chunks  ~ %6.1f GB to read", WY_START,
+             WY_END, n3, n3 * mb_per_chunk / 1e3)
+    log.info("    (only the Louisiana part is SAVED; outputs are much smaller)")
+
+
+# ----------------------------------------------------------------------------
+# STEP 2 - hourly flow 2018 (padded) for all Louisiana reaches
+# ----------------------------------------------------------------------------
+def step2_hourly(ds, reaches):
+    out = NWM_DIR / "nwm_LA_hourly_2018.zarr"
+    done_flag = NWM_DIR / "nwm_LA_hourly_2018.complete"
+    if done_flag.exists():
+        log.info("[2] hourly 2018 file exists - skipping.")
+        return
+    idx = selected_indices(reaches)
+    log.info("[2] Downloading hourly flow %s -> %s for %d reaches ...", START, END, len(idx))
+
+    sf = (ds["streamflow"].isel(feature_id=idx).sel(time=slice(START, END))
+          .reset_coords(drop=True).astype("float32"))
+    sf = sf.chunk({"time": 24 * 28, "feature_id": min(5000, len(idx))})
+    sf.encoding = {}
+    r = reaches.set_index("zarr_index").loc[idx]
+    out_ds = sf.to_dataset(name="streamflow").assign_coords(
+        latitude=("feature_id", r["lat"].to_numpy("float32")),
+        longitude=("feature_id", r["lon"].to_numpy("float32")),
+        parish_fips=("feature_id", r["parish_fips"].astype(str).to_numpy()),
+    )
+    out_ds["streamflow"].attrs = {"units": "m3 s-1", "long_name": "NWM v3.0 retrospective streamflow"}
+    out_ds.attrs = {"source": STORE, "time_zone": "UTC",
+                    "note": "Louisiana subset, padded window around 2018"}
+    for v in out_ds.variables.values():   # drop compressor settings inherited from S3
+        v.encoding = {}
+    t0 = time.time()
+    with ProgressBar():
+        out_ds.to_zarr(out, mode="w")
+    done_flag.touch()
+    log.info("[2] saved -> %s (%.1f min)", out, (time.time() - t0) / 60)
+
+
+# ----------------------------------------------------------------------------
+# STEP 3 - annual maxima 1980-2022 and flood thresholds per reach
+# ----------------------------------------------------------------------------
+def gumbel(mean, std, T):
+    """Gumbel (EV1) flow for return period T by the method of moments."""
+    alpha = np.sqrt(6) * std / np.pi
+    u = mean - 0.5772 * alpha
+    return u - alpha * np.log(-np.log(1 - 1 / T))
+
+
+def step3_annual_max(ds, reaches):
+    part_dir = NWM_DIR / "annual_max_parts"
+    part_dir.mkdir(exist_ok=True)
+    idx = selected_indices(reaches)
+    sf = ds["streamflow"].isel(feature_id=idx).reset_coords(drop=True)
+    fids = ds["feature_id"].values[idx]
+
+    years = list(range(WY_START, WY_END + 1))
+    todo = [wy for wy in years if not (part_dir / f"wy{wy}.npy").exists()]
+    log.info("[3] Annual maxima for %d water years (%d already done) ...",
+             len(years), len(years) - len(todo))
+    for wy in todo:
+        t0 = time.time()
+        mx = sf.sel(time=slice(f"{wy - 1}-10-01T00:00", f"{wy}-09-30T23:00")).max("time")
+        with ProgressBar(minimum=5):
+            vals = mx.compute().to_numpy().astype("float32")
+        np.save(part_dir / f"wy{wy}.npy", vals)
+        log.info("    WY%d done in %.1f min", wy, (time.time() - t0) / 60)
+
+    # ---- assemble -----------------------------------------------------------
+    mat = np.vstack([np.load(part_dir / f"wy{wy}.npy") for wy in years])  # years x reaches
+    long = pd.DataFrame({"feature_id": np.tile(fids, len(years)),
+                         "water_year": np.repeat(years, len(fids)),
+                         "qmax_cms": mat.ravel()})
+    long.to_parquet(NWM_DIR / "annual_max_LA.parquet", index=False)
+
+    mean, std = np.nanmean(mat, axis=0), np.nanstd(mat, axis=0, ddof=1)
+    thr = pd.DataFrame({
+        "feature_id": fids,
+        "n_years": np.sum(~np.isnan(mat), axis=0),
+        "q2_median_cms": np.nanmedian(mat, axis=0),   # empirical 2-yr flow
+        "q2_gumbel_cms": gumbel(mean, std, 2),
+        "q5_gumbel_cms": gumbel(mean, std, 5),
+        "q10_gumbel_cms": gumbel(mean, std, 10),
+        "q25_gumbel_cms": gumbel(mean, std, 25),
+        "qmax_mean_cms": mean, "qmax_std_cms": std,
+    })
+    thr = thr.merge(reaches[["feature_id", "parish_fips", "order"]
+                            if "order" in reaches else ["feature_id", "parish_fips"]],
+                    on="feature_id", how="left")
+    thr.to_csv(NWM_DIR / "reach_thresholds_LA.csv", index=False)
+    log.info("[3] thresholds for %d reaches -> reach_thresholds_LA.csv "
+             "(%d reaches have 2-yr flow = 0, e.g. dry ditches)",
+             len(thr), int((thr.q2_median_cms <= 0).sum()))
+
+
+# ----------------------------------------------------------------------------
+# STEP 4 - crosswalk to USGS + quick-check figures
+# ----------------------------------------------------------------------------
+def draw_parishes(ax, shapes):
+    for rings in shapes.values():
+        for ring in rings:
+            ax.add_patch(Polygon(ring, closed=True, fc="none", ec="#777777", lw=0.4))
+    ax.set_xlim(-94.1, -88.8)
+    ax.set_ylim(28.9, 33.1)
+    ax.set_aspect(1.15)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+def step4_check(reaches):
+    shapes, names = load_parishes()
+
+    # ---- crosswalk ----------------------------------------------------------
+    if "gage_id" not in reaches.columns:
+        reaches = reaches.assign(gage_id="")
+    xw = reaches[reaches["gage_id"].fillna("") != ""][
+        ["feature_id", "gage_id", "parish_fips", "parish_name"]].copy()
+    xw["monitoring_location_id"] = "USGS-" + xw["gage_id"]
+    man_path = USGS_DIR / "continuous_manifest.csv"
+    if man_path.exists():
+        man = pd.read_csv(man_path, dtype=str)
+        q_ok = set(man[(man.status == "ok") & (man.parameter_code == "00060")]
+                   .monitoring_location_id)
+        xw["usgs_2018_discharge"] = xw["monitoring_location_id"].isin(q_ok)
+    xw.to_csv(NWM_DIR / "usgs_nwm_crosswalk_LA.csv", index=False)
+    log.info("[4] %d NWM reaches carry a USGS gage ID (%d with 2018 USGS discharge)",
+             len(xw), int(xw.get("usgs_2018_discharge", pd.Series(dtype=bool)).sum()))
+
+    # ---- figure 5: reaches per parish + 2-yr flow ---------------------------
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6.5))
+    ax = axes[0]
+    per = reaches.groupby("parish_fips").size().reindex(
+        [f"22{c:03d}" for c in range(1, 128, 2)], fill_value=0).sort_values()
+    ax.barh([names.get(p, p) for p in per.index], per.values, color="#1f77b4")
+    ax.tick_params(axis="y", labelsize=6)
+    ax.set(title=f"A. NWM reaches per parish ({int((per > 0).sum())} of 64 parishes covered)",
+           xlabel="Number of reaches")
+
+    ax = axes[1]
+    draw_parishes(ax, shapes)
+    thr_path = NWM_DIR / "reach_thresholds_LA.csv"
+    if thr_path.exists():
+        thr = pd.read_csv(thr_path).merge(reaches[["feature_id", "lat", "lon"]], on="feature_id")
+        thr = thr[thr.q2_median_cms > 0].sort_values("q2_median_cms")
+        sc = ax.scatter(thr.lon, thr.lat, c=thr.q2_median_cms, s=0.3, cmap="viridis",
+                        norm=LogNorm(vmin=0.1, vmax=max(1.0, thr.q2_median_cms.max())))
+        fig.colorbar(sc, ax=ax, shrink=0.6, label="2-yr flow (m$^3$/s, log)")
+        ax.set_title("B. NWM 2-year flood flow per reach")
+    else:
+        ax.scatter(reaches.lon, reaches.lat, s=0.2, c="#1f77b4")
+        ax.set_title("B. NWM reaches (run step 3 for 2-yr flows)")
+    fig.tight_layout()
+    fig.savefig(FIG_DIR / "fig5_nwm_reaches.png", dpi=160)
+    plt.close(fig)
+
+    # ---- figure 6: NWM vs USGS hydrographs 2018 -----------------------------
+    hourly = NWM_DIR / "nwm_LA_hourly_2018.zarr"
+    cont = USGS_DIR / "continuous"
+    if not (hourly.exists() and cont.exists()):
+        log.info("[4] skipping NWM-vs-USGS figure (needs step 2 and USGS continuous files)")
+        return
+    nwm = xr.open_zarr(hourly)
+    cand = []
+    for _, r in xw.iterrows():
+        f = next(iter(cont.glob(f"{r.monitoring_location_id}_00060.*")), None)
+        if f is not None:
+            cand.append((r, f))
+    if not cand:
+        log.info("[4] no crosswalked gauge with USGS discharge file - no hydrograph figure")
+        return
+
+    stats, panels = [], []
+    for r, f in cand:
+        obs = pd.read_parquet(f) if f.suffix == ".parquet" else pd.read_csv(f)
+        obs["time"] = pd.to_datetime(obs["time"], utc=True)
+        q_obs = (obs.set_index("time")["value"].astype(float) * CFS_TO_CMS).resample("1h").mean()
+        q_nwm = nwm["streamflow"].sel(feature_id=int(r.feature_id)).to_series()
+        q_nwm.index = pd.to_datetime(q_nwm.index).tz_localize("UTC")
+        both = pd.concat([q_obs.rename("usgs"), q_nwm.rename("nwm")], axis=1).dropna()
+        both = both[both.index.year == 2018]
+        if len(both) < 24 * 60:
+            continue
+        stats.append({"monitoring_location_id": r.monitoring_location_id,
+                      "feature_id": r.feature_id, "parish": r.parish_name,
+                      "corr_hourly": both.usgs.corr(both.nwm),
+                      "peak_ratio_nwm_over_usgs": both.nwm.max() / both.usgs.max(),
+                      "peak_timing_diff_h": (both.nwm.idxmax() - both.usgs.idxmax())
+                      .total_seconds() / 3600})
+        panels.append((r, both))
+    if not stats:
+        return
+    st = pd.DataFrame(stats)
+    st.to_csv(NWM_DIR / "nwm_vs_usgs_2018_stats.csv", index=False)
+    log.info("[4] NWM vs USGS 2018 at %d gauges: median hourly r = %.2f, "
+             "median peak ratio = %.2f", len(st), st.corr_hourly.median(),
+             st.peak_ratio_nwm_over_usgs.median())
+
+    show = st.sort_values("corr_hourly").iloc[
+        np.unique(np.linspace(0, len(st) - 1, min(6, len(st))).astype(int))]
+    fig, axes = plt.subplots(len(show), 1, figsize=(12, 2.3 * len(show)), sharex=True)
+    axes = np.atleast_1d(axes)
+    lookup = {r.monitoring_location_id: both for r, both in panels}
+    for ax, (_, s) in zip(axes, show.iterrows()):
+        both = lookup[s.monitoring_location_id]
+        ax.plot(both.index, both.usgs, color="k", lw=0.9, label="USGS observed")
+        ax.plot(both.index, both.nwm, color="#d62728", lw=0.9, label="NWM v3.0")
+        ax.set_ylabel("m$^3$/s")
+        ax.set_title(f"{s.monitoring_location_id} ({s.parish})   r = {s.corr_hourly:.2f},  "
+                     f"peak ratio = {s.peak_ratio_nwm_over_usgs:.2f}", fontsize=9, loc="left")
+    axes[0].legend(loc="upper right", fontsize=8)
+    fig.suptitle("NWM vs USGS hourly flow in 2018 (worst to best agreement)", fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(FIG_DIR / "fig6_nwm_vs_usgs_2018.png", dpi=160)
+    plt.close(fig)
+
+
+# ----------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--steps", nargs="*", type=int, default=[1, 2, 3, 4])
+    ap.add_argument("--plan-only", action="store_true", help="only print the download plan")
+    ap.add_argument("--store", default=STORE)
+    ap.add_argument("--project-dir", default=str(PROJECT_DIR))
+    ap.add_argument("--workers", type=int, default=N_WORKERS)
+    args = ap.parse_args()
+
+    set_paths(Path(args.project_dir))
+    setup_logging()
+    dask.config.set(scheduler="threads", num_workers=args.workers)
+
+    ds = open_store(args.store)
+    reaches = step1_reaches(ds)
+    plan(ds, reaches, args.store)
+    if args.plan_only:
+        return
+    steps = set(args.steps)
+    if 2 in steps:
+        step2_hourly(ds, reaches)
+    if 3 in steps:
+        step3_annual_max(ds, reaches)
+    if 4 in steps:
+        step4_check(reaches)
+    log.info("Finished. Output folder: %s", NWM_DIR)
+
+
+if __name__ == "__main__":
+    main()
