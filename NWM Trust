@@ -1,0 +1,415 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Sep 25 13:49:53 2026
+
+@author: mh01
+"""
+
+"""
+STEP 6 - How much can we trust NWM in each parish?
+==================================================
+Compares the NWM 2018 results with USGS observations and gives every parish a
+confidence level (high / medium / low / unverified) that script 07 will use.
+
+Evidence used, per USGS gauge that sits on an NWM reach (crosswalk)
+  1. Hydrograph agreement   : hourly correlation r and peak ratio (from step 3)
+  2. Flood-year detection   : did the gauge exceed its 2-yr flow in 2018
+                              (annual peaks), and did NWM at that reach?
+  3. Event matching         : USGS events vs NWM events in time -> POD, FAR, CSI
+                              (only if both event files from step 5 exist)
+
+Gauge skill
+  crosswalk_error : NWM peak is < 1/20 or > 20x USGS -> gauge sits on the wrong or
+                    a tiny NWM channel; not used as evidence
+  good / fair / poor : hourly r >= 0.75 / 0.50-0.75 / < 0.50, then ONE level
+                      lower if NWM and USGS disagree on whether 2018 was a flood
+                      year at the gauge, or if fewer than half of the USGS events
+                      are matched (POD < 0.5)
+
+Parish confidence (score: good = 1, fair = 0.5, poor = 0)
+  gauges inside the parish -> their mean score
+  otherwise                -> distance-weighted score of the 3 nearest gauges
+                              within 75 km, capped at "medium" (borrowed
+                              evidence is never "high"); none -> "unverified"
+  high >= 0.75 | medium >= 0.40 | low < 0.40
+
+Reach flags (for step 7)
+  flag_persistent   : above threshold > 2000 h in 2018 (lake/backwater/regulated)
+  flag_extreme_ratio: peak > 10x its 2-yr flow (tiny streams) -> cap in step 7
+  use_reach         : evaluated and not persistent
+
+Outputs (data/evaluation/)
+  gauge_evaluation_2018.csv, matched_events_2018.csv, parish_confidence_2018.csv,
+  reach_flags_2018.csv, evaluation_summary.txt, figures/fig8_nwm_evaluation.png
+
+Usage: python 06_evaluate_nwm.py
+"""
+
+import argparse
+import json
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch, Polygon
+
+# ----------------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------------
+PROJECT_DIR = Path(r"D:\Tufts\Wishlist\Sepideh_2")
+YEAR = 2018
+MIN_PEAK_YEARS = 10
+R_GOOD, R_POOR = 0.75, 0.50
+XWALK_BAD_LOW, XWALK_BAD_HIGH = 0.05, 20.0
+MATCH_BUFFER_H = 48          # events match if their above-threshold periods
+                             # overlap within +/- 48 h
+K_NEAREST, MAX_DIST_KM = 3, 75
+HIGH, MEDIUM = 0.75, 0.40
+PERSISTENT_H, EXTREME_RATIO = 2000, 10
+
+SKILL_SCORE = {"good": 1.0, "fair": 0.5, "poor": 0.0}
+SKILL_COLOR = {"good": "#2ca02c", "fair": "#ffbf00", "poor": "#d62728",
+               "crosswalk_error": "#999999"}
+CONF_COLOR = {"high": "#2ca02c", "medium": "#ffbf00", "low": "#d62728",
+              "unverified": "#dddddd"}
+
+
+def set_paths(project_dir):
+    global USGS_DIR, NWM_DIR, EV_DIR, OUT_DIR, FIG_DIR
+    USGS_DIR = project_dir / "data" / "usgs"
+    NWM_DIR = project_dir / "data" / "nwm"
+    EV_DIR = project_dir / "data" / "events"
+    OUT_DIR = project_dir / "data" / "evaluation"
+    FIG_DIR = OUT_DIR / "figures"
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ----------------------------------------------------------------------------
+# HELPERS
+# ----------------------------------------------------------------------------
+def haversine_km(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(np.radians, (lat1, lon1, lat2, lon2))
+    a = (np.sin((lat2 - lat1) / 2) ** 2
+         + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2)
+    return 6371 * 2 * np.arcsin(np.sqrt(a))
+
+
+def load_parishes():
+    gj = json.loads((USGS_DIR / "la_parishes.geojson").read_text())
+    shapes, names, cent = {}, {}, {}
+    for f in gj["features"]:
+        g = f["geometry"]
+        polys = g["coordinates"] if g["type"] == "MultiPolygon" else [g["coordinates"]]
+        rings = [np.asarray(p[0]) for p in polys]
+        shapes[f["id"]] = rings
+        names[f["id"]] = f["properties"].get("NAME", f["id"])
+        big = max(rings, key=len)                     # centroid of the main polygon
+        x, y = big[:, 0], big[:, 1]
+        a = x[:-1] * y[1:] - x[1:] * y[:-1]
+        A = a.sum() / 2
+        cent[f["id"]] = (((y[:-1] + y[1:]) * a).sum() / (6 * A),
+                         ((x[:-1] + x[1:]) * a).sum() / (6 * A))   # (lat, lon)
+    return shapes, names, cent
+
+
+def draw_parishes(ax, shapes, colors=None):
+    for fips, rings in shapes.items():
+        for ring in rings:
+            ax.add_patch(Polygon(ring, closed=True, fc=(colors or {}).get(fips, "none"),
+                                 ec="#666666", lw=0.4))
+    ax.set_xlim(-94.1, -88.8)
+    ax.set_ylim(28.9, 33.1)
+    ax.set_aspect(1.15)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+def read_parquet_if(path):
+    return pd.read_parquet(path) if path.exists() else pd.DataFrame()
+
+
+# ----------------------------------------------------------------------------
+# 1. REACH FLAGS
+# ----------------------------------------------------------------------------
+def reach_flags():
+    rs = pd.read_csv(EV_DIR / "reach_summary_2018.csv", dtype={"parish_fips": str})
+    rs["flag_persistent"] = rs["hours_above"] > PERSISTENT_H
+    rs["flag_extreme_ratio"] = rs["max_peak_ratio"] > EXTREME_RATIO
+    rs["use_reach"] = rs["evaluated"] & ~rs["flag_persistent"]
+    rs["flooded_2018"] = rs["n_events"] > 0
+    rs.to_csv(OUT_DIR / "reach_flags_2018.csv", index=False)
+    return rs
+
+
+# ----------------------------------------------------------------------------
+# 2. OBSERVED FLOOD YEAR AT USGS GAUGES (annual peaks)
+# ----------------------------------------------------------------------------
+def observed_flood_2018(ev_usgs):
+    pk = pd.read_csv(USGS_DIR / "annual_peaks_LA.csv", dtype=str)
+    pk = pk[pk["parameter_code"] == "00060"].copy()
+    pk["v"] = pd.to_numeric(pk["value"], errors="coerce")
+    pk["t"] = pd.to_datetime(pk["time"], errors="coerce")
+    pk = pk.dropna(subset=["v"]).drop_duplicates(["monitoring_location_id", "water_year"])
+    g = pk.groupby("monitoring_location_id")["v"]
+    med = g.median()[g.count() >= MIN_PEAK_YEARS]
+    p18 = pk[pk["t"].dt.year == YEAR].groupby("monitoring_location_id")["v"].max()
+    obs = pd.DataFrame({"q2_obs_cfs": med}).join(p18.rename("peak_2018_cfs"))
+    obs["obs_flooded_2018"] = np.where(obs["peak_2018_cfs"].notna(),
+                                       obs["peak_2018_cfs"] > obs["q2_obs_cfs"], np.nan)
+    # a 2018 USGS event from the continuous record also proves a flood
+    if len(ev_usgs):
+        flooded = set(ev_usgs.loc[ev_usgs.parameter_code == "00060", "monitoring_location_id"])
+        obs.loc[obs.index.isin(flooded), "obs_flooded_2018"] = True
+    obs["obs_flooded_2018"] = obs["obs_flooded_2018"].astype("object")
+    return obs
+
+
+# ----------------------------------------------------------------------------
+# 3. EVENT MATCHING
+# ----------------------------------------------------------------------------
+def match_events(u, n):
+    """Greedy one-to-one matching of USGS (u) and NWM (n) events of one gauge."""
+    buf = pd.Timedelta(hours=MATCH_BUFFER_H)
+    pairs, used = [], set()
+    for i, ue in u.sort_values("peak_utc").iterrows():
+        best, best_dt = None, None
+        for j, ne in n.iterrows():
+            if j in used:
+                continue
+            overlap = (ne.start_utc <= ue.end_utc + buf) and (ne.end_utc >= ue.start_utc - buf)
+            if overlap:
+                dt = abs((ne.peak_utc - ue.peak_utc).total_seconds())
+                if best is None or dt < best_dt:
+                    best, best_dt = j, dt
+        if best is not None:
+            used.add(best)
+            pairs.append((i, best))
+    return pairs
+
+
+def event_matching(gauges, ev_usgs, ev_nwm):
+    if ev_usgs.empty or ev_nwm.empty:
+        print("  ! event files from step 5 not found - skipping event matching")
+        return pd.DataFrame(), pd.DataFrame()
+    uq = ev_usgs[ev_usgs.parameter_code == "00060"]
+    stats, rows = [], []
+    for _, g in gauges.iterrows():
+        u = uq[uq.monitoring_location_id == g.monitoring_location_id]
+        n = ev_nwm[ev_nwm.feature_id == g.feature_id]
+        pairs = match_events(u, n)
+        H, M, F = len(pairs), len(u) - len(pairs), len(n) - len(pairs)
+        stats.append({"monitoring_location_id": g.monitoring_location_id,
+                      "n_usgs_events": len(u), "n_nwm_events": len(n),
+                      "hits": H, "misses": M, "false_alarms": F,
+                      "POD": H / len(u) if len(u) else np.nan,
+                      "FAR": F / len(n) if len(n) else np.nan,
+                      "CSI": H / (H + M + F) if (H + M + F) else np.nan})
+        for i, j in pairs:
+            ue, ne = u.loc[i], n.loc[j]
+            rows.append({"monitoring_location_id": g.monitoring_location_id,
+                         "feature_id": g.feature_id, "parish_fips": g.parish_fips,
+                         "usgs_peak_utc": ue.peak_utc, "nwm_peak_utc": ne.peak_utc,
+                         "peak_time_diff_h": (ne.peak_utc - ue.peak_utc).total_seconds() / 3600,
+                         "usgs_peak_ratio": ue.peak_ratio, "nwm_peak_ratio": ne.peak_ratio,
+                         "usgs_rise_h": ue.rise_time_h, "nwm_rise_h": ne.rise_time_h,
+                         "usgs_severity_norm": ue.severity_norm,
+                         "nwm_severity_norm": ne.severity_norm})
+    return pd.DataFrame(stats), pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------
+# 4. GAUGE SKILL
+# ----------------------------------------------------------------------------
+def classify(row):
+    """Skill from the hydrograph, then one level down if NWM disagrees with USGS
+    about whether 2018 was a flood year at this gauge (missed flood or false alarm)."""
+    pr, r = row["peak_ratio_nwm_over_usgs"], row["corr_hourly"]
+    if pr < XWALK_BAD_LOW or pr > XWALK_BAD_HIGH:
+        return "crosswalk_error"
+    level = "good" if r >= R_GOOD else "poor" if r < R_POOR else "fair"
+    obs, nwm = row["obs_flooded_2018"], row["nwm_flooded_2018"]
+    disagree = isinstance(obs, bool) and isinstance(nwm, bool) and obs != nwm
+    pod = row.get("POD", np.nan)
+    if disagree or (pd.notna(pod) and pod < 0.5):
+        level = {"good": "fair", "fair": "poor", "poor": "poor"}[level]
+    return level
+
+
+# ----------------------------------------------------------------------------
+# 5. PARISH CONFIDENCE
+# ----------------------------------------------------------------------------
+def parish_confidence(gauges, rs, names, cent):
+    ev = gauges[gauges.skill != "crosswalk_error"]
+    rows = []
+    for fips in sorted(cent):
+        inside = ev[ev.parish_fips == fips]
+        lat, lon = cent[fips]
+        if len(inside):
+            score, basis = inside.skill.map(SKILL_SCORE).mean(), f"{len(inside)} gauge(s) inside"
+            used = inside
+        else:
+            d = haversine_km(lat, lon, ev.lat.to_numpy(), ev.lon.to_numpy())
+            near = ev.assign(dist_km=d).nsmallest(K_NEAREST, "dist_km")
+            near = near[near.dist_km <= MAX_DIST_KM]
+            if near.empty:
+                score, basis, used = np.nan, f"no gauge within {MAX_DIST_KM} km", near
+            else:
+                w = 1 / np.maximum(near.dist_km, 5)
+                score = float((near.skill.map(SKILL_SCORE) * w).sum() / w.sum())
+                basis = f"{len(near)} nearest gauge(s), {near.dist_km.min():.0f}-{near.dist_km.max():.0f} km"
+                used = near
+        conf = ("unverified" if np.isnan(score) else
+                "high" if score >= HIGH else "medium" if score >= MEDIUM else "low")
+        if conf == "high" and not len(inside):
+            conf = "medium"          # no gauge inside the parish -> at most medium
+
+        r = rs[(rs.parish_fips == fips) & rs.use_reach]
+        rows.append({"parish_fips": fips, "parish_name": names.get(fips, fips),
+                     "confidence": conf, "score": round(score, 2) if not np.isnan(score) else np.nan,
+                     "basis": basis, "evidence_gauges": ";".join(used.monitoring_location_id),
+                     "median_r": used.corr_hourly.median() if len(used) else np.nan,
+                     "n_reaches_used": len(r),
+                     "nwm_share_reaches_flooded": r.flooded_2018.mean() if len(r) else np.nan})
+    pc = pd.DataFrame(rows)
+
+    # observed vs NWM flood share among gauges inside each parish (information only)
+    g = gauges.dropna(subset=["obs_flooded_2018"])
+    obs_share = g.groupby("parish_fips")["obs_flooded_2018"].apply(lambda s: s.astype(bool).mean())
+    pc["usgs_share_gauges_flooded"] = pc.parish_fips.map(obs_share)
+    return pc
+
+
+# ----------------------------------------------------------------------------
+# 6. FIGURE
+# ----------------------------------------------------------------------------
+def figure(gauges, pc, shapes, matched):
+    fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+
+    ax = axes[0, 0]
+    draw_parishes(ax, shapes)
+    for sk, col in SKILL_COLOR.items():
+        d = gauges[gauges.skill == sk]
+        ax.scatter(d.lon, d.lat, s=45, c=col, edgecolor="k", lw=0.5, label=f"{sk} ({len(d)})")
+    ax.legend(loc="lower left", fontsize=8, title="NWM skill at gauge")
+    ax.set_title("A. How well NWM matches USGS at each gauge")
+
+    ax = axes[0, 1]
+    draw_parishes(ax, shapes, pc.set_index("parish_fips").confidence.map(CONF_COLOR).to_dict())
+    cnt = pc.confidence.value_counts()
+    ax.legend(handles=[Patch(color=c, label=f"{k} ({cnt.get(k, 0)})") for k, c in CONF_COLOR.items()],
+              loc="lower left", fontsize=8, title="Parish confidence")
+    ax.set_title("B. Confidence in NWM flood results per parish")
+
+    if len(matched):
+        ax = axes[1, 0]
+        ax.scatter(matched.usgs_peak_ratio, matched.nwm_peak_ratio, s=18, c="#1f77b4", alpha=0.7)
+        lim = [0.9, max(matched[["usgs_peak_ratio", "nwm_peak_ratio"]].max().max(), 2) * 1.1]
+        ax.plot(lim, lim, "k--", lw=1)
+        ax.set(xscale="log", yscale="log", xlim=lim, ylim=lim,
+               xlabel="USGS peak / 2-yr flow", ylabel="NWM peak / 2-yr flow",
+               title=f"C. Magnitude of matched events (n = {len(matched)})")
+        ax = axes[1, 1]
+        ax.scatter(matched.usgs_rise_h, matched.nwm_rise_h, s=18, c="#d62728", alpha=0.7)
+        lim = [0.9, max(matched[["usgs_rise_h", "nwm_rise_h"]].max().max(), 10) * 1.1]
+        ax.plot(lim, lim, "k--", lw=1)
+        ax.set(xscale="log", yscale="log", xlim=lim, ylim=lim,
+               xlabel="USGS rise time (h)", ylabel="NWM rise time (h)",
+               title="D. Duration (rise time) of matched events")
+    else:
+        ax = axes[1, 0]
+        d = gauges.dropna(subset=["corr_hourly"])
+        ax.scatter(d.corr_hourly, d.peak_ratio_nwm_over_usgs.clip(0.01, 100), s=30,
+                   c=d.skill.map(SKILL_COLOR), edgecolor="k", lw=0.4)
+        ax.axvline(R_GOOD, ls="--", c="k", lw=0.8)
+        ax.axvline(R_POOR, ls=":", c="k", lw=0.8)
+        ax.set(yscale="log", xlabel="Hourly correlation r", ylabel="NWM / USGS peak (log)",
+               title="C. Hydrograph agreement per gauge")
+        ax = axes[1, 1]
+        tab = pd.crosstab(gauges.obs_flooded_2018.astype(str), gauges.nwm_flooded_2018.astype(str))
+        ax.axis("off")
+        t = ax.table(cellText=tab.values, rowLabels=[f"USGS flooded: {i}" for i in tab.index],
+                     colLabels=[f"NWM flooded: {c}" for c in tab.columns], loc="center")
+        t.scale(1, 2)
+        ax.set_title("D. Did NWM flood where USGS flooded? (gauges)")
+    fig.tight_layout()
+    fig.savefig(FIG_DIR / "fig8_nwm_evaluation.png", dpi=160)
+    plt.close(fig)
+
+
+# ----------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project-dir", default=str(PROJECT_DIR))
+    args = ap.parse_args()
+    set_paths(Path(args.project_dir))
+
+    shapes, names, cent = load_parishes()
+    rs = reach_flags()
+    ev_usgs = read_parquet_if(EV_DIR / "events_usgs_2018.parquet")
+    ev_nwm = read_parquet_if(EV_DIR / "events_nwm_2018.parquet")
+
+    # ---- gauges on NWM reaches ---------------------------------------------
+    gauges = pd.read_csv(NWM_DIR / "nwm_vs_usgs_2018_stats.csv", dtype={"monitoring_location_id": str})
+    sites = pd.read_csv(USGS_DIR / "sites_LA.csv", dtype=str)[
+        ["monitoring_location_id", "monitoring_location_name", "parish_fips", "lat", "lon"]]
+    sites[["lat", "lon"]] = sites[["lat", "lon"]].astype(float)
+    gauges = gauges.drop(columns=["parish"], errors="ignore").merge(
+        sites, on="monitoring_location_id", how="left")
+    gauges = gauges.join(observed_flood_2018(ev_usgs), on="monitoring_location_id")
+    nwm_fl = rs.set_index("feature_id")
+    gauges["nwm_flooded_2018"] = gauges.feature_id.map(
+        nwm_fl.flooded_2018.where(nwm_fl.evaluated)).astype("object")
+    gauges.loc[gauges.nwm_flooded_2018.isna(), "nwm_flooded_2018"] = np.nan
+    for c in ("obs_flooded_2018", "nwm_flooded_2018"):
+        gauges[c] = gauges[c].map(lambda v: bool(v) if isinstance(v, (bool, np.bool_)) or v in (0, 1) else np.nan)
+
+    ev_stats, matched = event_matching(gauges, ev_usgs, ev_nwm)
+    if len(ev_stats):
+        gauges = gauges.merge(ev_stats, on="monitoring_location_id", how="left")
+    gauges["skill"] = gauges.apply(classify, axis=1)
+    gauges.to_csv(OUT_DIR / "gauge_evaluation_2018.csv", index=False)
+    if len(matched):
+        matched.to_csv(OUT_DIR / "matched_events_2018.csv", index=False)
+
+    pc = parish_confidence(gauges, rs, names, cent)
+    pc.to_csv(OUT_DIR / "parish_confidence_2018.csv", index=False)
+    figure(gauges, pc, shapes, matched)
+
+    # ---- plain-language summary --------------------------------------------
+    sk = gauges.skill.value_counts()
+    both = gauges.dropna(subset=["obs_flooded_2018", "nwm_flooded_2018"])
+    obs_yes = both[both.obs_flooded_2018 == True]  # noqa: E712
+    lines = [
+        "NWM EVALUATION 2018",
+        "=" * 60,
+        f"Gauges on NWM reaches: {len(gauges)}  ->  " +
+        ", ".join(f"{k}: {sk.get(k, 0)}" for k in SKILL_COLOR),
+        f"Gauges where USGS flooded in {YEAR}: {len(obs_yes)}; "
+        f"NWM also flooded at {int(obs_yes.nwm_flooded_2018.astype(bool).sum())} of them",
+    ]
+    if len(ev_stats):
+        tot = ev_stats[["hits", "misses", "false_alarms"]].sum()
+        lines.append(f"Event matching: {tot.hits} hits, {tot.misses} misses, {tot.false_alarms} "
+                     f"false alarms  ->  POD {tot.hits / max(tot.hits + tot.misses, 1):.2f}, "
+                     f"FAR {tot.false_alarms / max(tot.hits + tot.false_alarms, 1):.2f}")
+    if len(matched):
+        lines.append(f"Matched events: median NWM/USGS peak-ratio "
+                     f"{(matched.nwm_peak_ratio / matched.usgs_peak_ratio).median():.2f}, "
+                     f"median peak-time difference {matched.peak_time_diff_h.median():+.0f} h")
+    lines += ["", "Reach flags: "
+              f"{int(rs.flag_persistent.sum())} persistent (excluded), "
+              f"{int(rs.flag_extreme_ratio.sum())} extreme ratio (cap in step 7)", "",
+              "Parish confidence:"]
+    for c in CONF_COLOR:
+        d = pc[pc.confidence == c]
+        lines.append(f"  {c:<10} ({len(d):2d}): " + ", ".join(d.parish_name))
+    txt = "\n".join(lines)
+    (OUT_DIR / "evaluation_summary.txt").write_text(txt, encoding="utf-8")
+    print(txt)
+    print(f"\nOutputs in {OUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
