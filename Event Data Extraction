@@ -1,0 +1,400 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Sep 25 13:42:59 2026
+
+@author: mh01
+"""
+
+"""
+STEP 5 - Extract 2018 flood events (NWM reaches + USGS gauges)
+=============================================================
+For every river reach (NWM) and gauge (USGS) this script finds each period in
+2018 when flow (or stage) went above a flood threshold, and describes it the
+way Khajehei et al. (2020) do:
+
+  magnitude  = peak flow of the event                       (m3/s)
+  duration   = rise time = time of peak - time the threshold
+               was first exceeded                            (hours)
+  severity   = magnitude / duration                          (m3/s per hour)
+  frequency  = number of events (counted later, per parish)
+
+Because a ditch and the Mississippi cannot be compared in m3/s, it also stores
+NORMALISED versions that are comparable everywhere:
+  peak_ratio     = peak / threshold        (1.5 = 50% above the 2-yr flow)
+  severity_norm  = peak_ratio / rise time  (per hour)
+
+Thresholds
+  NWM reaches         : the reach's own 2-yr flow (median of 43 annual maxima,
+                        from step 3). Model vs. model, so model bias cancels.
+  USGS discharge      : 2-yr flow from the gauge's annual peaks (>= 10 years)
+  USGS stage          : NWS flood stage (only 40 gauges have one)
+
+Inputs  (from steps 1 and 3)
+  data/nwm/nwm_LA_hourly_2018.zarr, reach_thresholds_LA.csv, reaches_LA.csv
+  data/usgs/continuous/*, annual_peaks_LA.csv, thresholds_LA.csv, sites_LA.csv
+
+Outputs (data/events/)
+  events_nwm_2018.parquet     one row per NWM reach-event
+  events_usgs_2018.parquet    one row per USGS gauge-event (discharge and stage)
+  reach_summary_2018.csv      per reach: evaluated? n events, max peak_ratio ...
+  figures/fig7_events_2018.png
+
+Requirements: pip install xarray zarr pandas pyarrow matplotlib numpy
+Usage       : python 05_extract_flood_events.py
+"""
+
+import argparse
+import json
+import logging
+import re
+import time
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import xarray as xr
+from matplotlib.colors import LogNorm
+from matplotlib.patches import Polygon
+
+# ----------------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------------
+PROJECT_DIR = Path(r"D:\Tufts\Wishlist\Sepideh_2")
+YEAR = 2018
+LOCAL_TZ = "America/Chicago"       # events are assigned to LOCAL calendar days
+
+MERGE_GAP_H = 24      # two exceedances less than 24 h apart = one event
+MIN_Q2_CMS = 0.1      # skip reaches whose 2-yr flow is below this (dry ditches)
+BIG_RIVER_Q2 = 3000   # flag reaches with 2-yr flow above this (Mississippi,
+                      # Atchafalaya, lower Red): their floods come from upstream
+MIN_PEAK_YEARS = 10   # USGS: years of annual peaks needed for a 2-yr flow
+USGS_RESAMPLE = "1h"  # put USGS on the same hourly step as NWM (None = native)
+BLOCK = 5000          # NWM reaches read into memory at once (~200 MB; matches file chunks)
+CFS_TO_CMS = 0.0283168
+
+FLOOD_STAGE_RE = re.compile(r"(?:national weather service|nws).*flood\s*stage", re.I)
+NOT_BASE_STAGE_RE = re.compile(r"moderate|major|discharge", re.I)
+
+log = logging.getLogger("events")
+
+
+def set_paths(project_dir):
+    global USGS_DIR, NWM_DIR, EV_DIR, FIG_DIR
+    USGS_DIR = project_dir / "data" / "usgs"
+    NWM_DIR = project_dir / "data" / "nwm"
+    EV_DIR = project_dir / "data" / "events"
+    FIG_DIR = EV_DIR / "figures"
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s",
+        handlers=[logging.FileHandler(EV_DIR / "events_log.txt", encoding="utf-8"),
+                  logging.StreamHandler()])
+
+
+# ----------------------------------------------------------------------------
+# CORE: find events in one time series
+# ----------------------------------------------------------------------------
+def find_events(times, q, thr, step_h=1.0):
+    """Return a list of dicts, one per event where q > thr.
+
+    times : numpy datetime64 array (UTC), regular step of `step_h` hours
+    q     : values (NaN allowed; NaN counts as 'not above')
+    """
+    above = np.nan_to_num(q, nan=-np.inf) > thr
+    if not above.any():
+        return []
+    d = np.diff(np.r_[0, above.astype(np.int8), 0])
+    starts = np.flatnonzero(d == 1)
+    ends = np.flatnonzero(d == -1) - 1          # inclusive
+    gap = int(MERGE_GAP_H / step_h)
+
+    ms, me = [starts[0]], [ends[0]]
+    for s, e in zip(starts[1:], ends[1:]):
+        if s - me[-1] - 1 <= gap:
+            me[-1] = e
+        else:
+            ms.append(s)
+            me.append(e)
+
+    out = []
+    n = len(q)
+    for s, e in zip(ms, me):
+        p = s + int(np.nanargmax(q[s:e + 1]))
+        rise = max((times[p] - times[s]) / np.timedelta64(1, "h"), step_h)
+        dur = (times[e] - times[s]) / np.timedelta64(1, "h") + step_h
+        out.append({"start_utc": times[s], "peak_utc": times[p], "end_utc": times[e],
+                    "peak": float(q[p]), "rise_time_h": rise, "duration_above_h": dur,
+                    "censored_start": s == 0, "censored_end": e == n - 1})
+    return out
+
+
+def finish_table(ev, thr_col="threshold", is_flow=True):
+    """Add normalised metrics and local dates; keep events whose peak is in YEAR."""
+    if ev.empty:
+        return ev
+    for c in ("start_utc", "peak_utc", "end_utc"):
+        ev[c] = pd.to_datetime(ev[c], utc=True)
+    ev["peak_local"] = ev["peak_utc"].dt.tz_convert(LOCAL_TZ)
+    ev["start_date_local"] = ev["start_utc"].dt.tz_convert(LOCAL_TZ).dt.date
+    ev["peak_date_local"] = ev["peak_local"].dt.date
+    ev["end_date_local"] = ev["end_utc"].dt.tz_convert(LOCAL_TZ).dt.date
+    ev = ev[ev["peak_local"].dt.year == YEAR].copy()
+    ev["peak_excess"] = ev["peak"] - ev[thr_col]
+    ev["severity"] = ev["peak"] / ev["rise_time_h"]
+    if is_flow:
+        ev["peak_ratio"] = ev["peak"] / ev[thr_col]
+        ev["severity_norm"] = ev["peak_ratio"] / ev["rise_time_h"]
+    else:   # stage in feet: a ratio of stages depends on the gauge datum
+        ev["peak_ratio"] = np.nan
+        ev["severity_norm"] = ev["peak_excess"] / ev["rise_time_h"]
+    ev["month"] = ev["peak_local"].dt.month
+    return ev.drop(columns=["peak_local"])
+
+
+# ----------------------------------------------------------------------------
+# NWM
+# ----------------------------------------------------------------------------
+def nwm_events():
+    reaches = pd.read_csv(NWM_DIR / "reaches_LA.csv", dtype={"parish_fips": str, "gage_id": str})
+    thr = pd.read_csv(NWM_DIR / "reach_thresholds_LA.csv", dtype={"parish_fips": str})
+    ds = xr.open_zarr(NWM_DIR / "nwm_LA_hourly_2018.zarr")
+    fids = ds["feature_id"].values
+    times = ds["time"].values
+
+    thr = thr.set_index("feature_id").reindex(fids)
+    q2 = thr["q2_median_cms"].to_numpy("float64")
+    usable = np.isfinite(q2) & (q2 >= MIN_Q2_CMS)
+    log.info("[NWM] %d reaches; %d usable (%d no threshold, %d with 2-yr flow < %.1f m3/s)",
+             len(fids), usable.sum(), (~np.isfinite(q2)).sum(),
+             (np.isfinite(q2) & (q2 < MIN_Q2_CMS)).sum(), MIN_Q2_CMS)
+
+    rows, t0 = [], time.time()
+    for b0 in range(0, len(fids), BLOCK):
+        b1 = min(b0 + BLOCK, len(fids))
+        block = ds["streamflow"].isel(feature_id=slice(b0, b1)).values   # time x reaches
+        thr_b = q2[b0:b1]
+        cand = np.flatnonzero(usable[b0:b1] & (np.nanmax(block, axis=0) > np.nan_to_num(thr_b, nan=np.inf)))
+        for j in cand:
+            for e in find_events(times, block[:, j], thr_b[j]):
+                e["feature_id"] = int(fids[b0 + j])
+                e["threshold"] = thr_b[j]
+                rows.append(e)
+        log.info("    reaches %6d-%6d done (%d events so far, %.1f min)",
+                 b0, b1, len(rows), (time.time() - t0) / 60)
+
+    ev = finish_table(pd.DataFrame(rows))
+    meta = reaches[["feature_id", "parish_fips", "parish_name", "order", "gage_id"]
+                   if "order" in reaches else ["feature_id", "parish_fips", "parish_name"]]
+    ev = ev.merge(meta, on="feature_id", how="left")
+    ev["big_river"] = ev["threshold"] > BIG_RIVER_Q2
+    ev.insert(0, "source", "NWM")
+    ev.to_parquet(EV_DIR / "events_nwm_2018.parquet", index=False)
+
+    # per-reach summary (includes reaches with zero events -> needed for frequency)
+    summ = pd.DataFrame({"feature_id": fids, "q2_cms": q2, "evaluated": usable})
+    g = ev.groupby("feature_id")
+    summ = summ.merge(g.size().rename("n_events"), on="feature_id", how="left")
+    summ = summ.merge(g["peak_ratio"].max().rename("max_peak_ratio"), on="feature_id", how="left")
+    summ = summ.merge(g["duration_above_h"].sum().rename("hours_above"), on="feature_id", how="left")
+    summ[["n_events", "hours_above"]] = summ[["n_events", "hours_above"]].fillna(0)
+    summ["big_river"] = summ["q2_cms"] > BIG_RIVER_Q2
+    summ = summ.merge(reaches[["feature_id", "parish_fips", "parish_name", "lat", "lon"]],
+                      on="feature_id", how="left")
+    summ.to_csv(EV_DIR / "reach_summary_2018.csv", index=False)
+
+    n_fl = int((summ.n_events > 0).sum())
+    log.info("[NWM] %d events in %d; %d of %d usable reaches (%.1f%%) flooded at least once",
+             len(ev), YEAR, n_fl, usable.sum(), 100 * n_fl / max(usable.sum(), 1))
+    return ev, summ
+
+
+# ----------------------------------------------------------------------------
+# USGS
+# ----------------------------------------------------------------------------
+def read_usgs(path):
+    df = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    if "time_series_id" in df.columns and df["time_series_id"].nunique() > 1:
+        main = df.groupby("time_series_id")["value"].count().idxmax()   # longest series
+        df = df[df["time_series_id"] == main]
+    s = df.dropna(subset=["value"]).drop_duplicates("time").set_index("time")["value"].sort_index()
+    if USGS_RESAMPLE:
+        full = pd.date_range(s.index.min().floor("h"), s.index.max().ceil("h"),
+                             freq=USGS_RESAMPLE, tz="UTC")
+        s = s.resample(USGS_RESAMPLE).mean().reindex(full)
+    return s
+
+
+def usgs_thresholds():
+    """2-yr flow (cfs) from annual peaks, and NWS flood stage (ft)."""
+    pk = pd.read_csv(USGS_DIR / "annual_peaks_LA.csv", dtype=str)
+    pk = pk[pk["parameter_code"] == "00060"].copy()
+    pk["value"] = pd.to_numeric(pk["value"], errors="coerce")
+    pk = pk.dropna(subset=["value"]).drop_duplicates(["monitoring_location_id", "water_year"])
+    g = pk.groupby("monitoring_location_id")["value"]
+    q2 = g.median()[g.count() >= MIN_PEAK_YEARS]
+
+    th = pd.read_csv(USGS_DIR / "thresholds_LA.csv", dtype=str)
+    th = th[th["threshold_name"].fillna("").str.contains(FLOOD_STAGE_RE)
+            & ~th["threshold_name"].fillna("").str.contains(NOT_BASE_STAGE_RE)
+            & (th["parameter_code"] == "00065")].copy()
+    th["value"] = pd.to_numeric(th["value"], errors="coerce")
+    fs = th.groupby("monitoring_location_id")["value"].min()
+    return q2, fs
+
+
+def usgs_events():
+    cont = USGS_DIR / "continuous"
+    if not cont.exists():
+        log.info("[USGS] no continuous/ folder - skipped")
+        return pd.DataFrame()
+    q2_cfs, fs_ft = usgs_thresholds()
+    sites = pd.read_csv(USGS_DIR / "sites_LA.csv", dtype=str)
+    rows, n_eval = [], {"00060": 0, "00065": 0}
+    step_h = 1.0 if USGS_RESAMPLE == "1h" else 0.25
+
+    for f in sorted(cont.glob("USGS-*_*.*")):
+        site, pc = f.name.split(".")[0].rsplit("_", 1)
+        if pc == "00060" and site in q2_cfs.index:
+            thr, scale = q2_cfs[site] * CFS_TO_CMS, CFS_TO_CMS
+        elif pc == "00065" and site in fs_ft.index:
+            thr, scale = fs_ft[site], 1.0
+        else:
+            continue
+        s = read_usgs(f) * scale
+        n_eval[pc] += 1
+        for e in find_events(s.index.to_numpy(dtype="datetime64[ns]"), s.to_numpy("float64"),
+                             thr, step_h):
+            e.update({"monitoring_location_id": site, "parameter_code": pc, "threshold": thr})
+            rows.append(e)
+
+    ev = pd.DataFrame(rows)
+    if ev.empty:
+        log.info("[USGS] no events found")
+        return ev
+    parts = [finish_table(ev[ev.parameter_code == "00060"].copy(), is_flow=True),
+             finish_table(ev[ev.parameter_code == "00065"].copy(), is_flow=False)]
+    ev = pd.concat([p for p in parts if not p.empty], ignore_index=True)
+    ev["unit"] = np.where(ev.parameter_code == "00060", "m3/s", "ft")
+    ev = ev.merge(sites[["monitoring_location_id", "parish_fips", "county_name"]],
+                  on="monitoring_location_id", how="left")
+    ev.insert(0, "source", "USGS")
+    ev.to_parquet(EV_DIR / "events_usgs_2018.parquet", index=False)
+    for pc, lab in (("00060", "discharge (2-yr flow)"), ("00065", "stage (NWS flood stage)")):
+        e = ev[ev.parameter_code == pc]
+        log.info("[USGS] %-25s: %3d gauges evaluated, %3d flooded, %4d events",
+                 lab, n_eval[pc], e.monitoring_location_id.nunique(), len(e))
+    return ev
+
+
+# ----------------------------------------------------------------------------
+# FIGURE
+# ----------------------------------------------------------------------------
+def load_parishes():
+    gj = json.loads((USGS_DIR / "la_parishes.geojson").read_text())
+    shapes = {}
+    for f in gj["features"]:
+        g = f["geometry"]
+        polys = g["coordinates"] if g["type"] == "MultiPolygon" else [g["coordinates"]]
+        shapes[f["id"]] = [np.asarray(p[0]) for p in polys]
+    return shapes
+
+
+def draw_parishes(ax, shapes, colors=None):
+    for fips, rings in shapes.items():
+        for ring in rings:
+            ax.add_patch(Polygon(ring, closed=True, fc=(colors or {}).get(fips, "none"),
+                                 ec="#777777", lw=0.4))
+    ax.set_xlim(-94.1, -88.8)
+    ax.set_ylim(28.9, 33.1)
+    ax.set_aspect(1.15)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+def figure(ev_nwm, summ, ev_usgs):
+    try:
+        shapes = load_parishes()
+    except FileNotFoundError:
+        shapes = {}
+    fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+
+    # A. reaches that flooded
+    ax = axes[0, 0]
+    draw_parishes(ax, shapes)
+    s0 = summ[summ.evaluated & (summ.n_events == 0)]
+    s1 = summ[summ.n_events > 0].sort_values("n_events")
+    ax.scatter(s0.lon, s0.lat, s=0.2, c="#cccccc")
+    sc = ax.scatter(s1.lon, s1.lat, s=1.2, c=s1.n_events, cmap="plasma_r",
+                    vmin=1, vmax=max(2, s1.n_events.quantile(0.98) if len(s1) else 2))
+    fig.colorbar(sc, ax=ax, shrink=0.6, label="Events in 2018")
+    ax.set_title(f"A. NWM reaches above their 2-yr flow in {YEAR}\n"
+                 f"({len(s1):,} of {int(summ.evaluated.sum()):,} reaches; grey = no event)")
+
+    # B. share of each parish's reaches that flooded
+    ax = axes[0, 1]
+    ev_ok = summ[summ.evaluated]
+    share = ev_ok.assign(flooded=ev_ok.n_events > 0).groupby("parish_fips")["flooded"].mean()
+    cmap = plt.get_cmap("Blues")
+    vmax = max(share.max(), 0.01) if len(share) else 1
+    draw_parishes(ax, shapes, {p: cmap(v / vmax) for p, v in share.items()})
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 100 * vmax))
+    fig.colorbar(sm, ax=ax, shrink=0.6, label="% of parish reaches with >= 1 event")
+    ax.set_title("B. How much of each parish flooded (NWM)")
+
+    # C. month of the peak
+    ax = axes[1, 0]
+    months = np.arange(1, 13)
+    nw = ev_nwm.groupby("month").size().reindex(months, fill_value=0)
+    ax.bar(months - 0.2, nw / max(nw.sum(), 1) * 100, width=0.4, color="#d62728",
+           label=f"NWM reach-events ({len(ev_nwm):,})")
+    if len(ev_usgs):
+        uq = ev_usgs[ev_usgs.parameter_code == "00060"]
+        us = uq.groupby("month").size().reindex(months, fill_value=0)
+        ax.bar(months + 0.2, us / max(us.sum(), 1) * 100, width=0.4, color="k",
+               label=f"USGS discharge events ({len(uq)})")
+    ax.set(xticks=months, xticklabels=list("JFMAMJJASOND"), ylabel="% of events",
+           title=f"C. When did the {YEAR} floods peak?")
+    ax.legend()
+
+    # D. rise time distribution (the paper's 'duration')
+    ax = axes[1, 1]
+    bins = np.logspace(0, np.log10(max(ev_nwm.rise_time_h.max() if len(ev_nwm) else 10, 10)), 30)
+    ax.hist(ev_nwm.rise_time_h, bins=bins, color="#d62728", alpha=0.6, density=True, label="NWM")
+    if len(ev_usgs):
+        uq = ev_usgs[ev_usgs.parameter_code == "00060"]
+        if len(uq):
+            ax.hist(uq.rise_time_h, bins=bins, histtype="step", color="k", lw=1.5,
+                    density=True, label="USGS discharge")
+    ax.set_xscale("log")
+    ax.set(xlabel="Rise time = duration (hours, log)", ylabel="Density",
+           title="D. Flood duration (rise time)")
+    ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(FIG_DIR / "fig7_events_2018.png", dpi=160)
+    plt.close(fig)
+
+
+# ----------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project-dir", default=str(PROJECT_DIR))
+    args = ap.parse_args()
+    set_paths(Path(args.project_dir))
+
+    ev_nwm, summ = nwm_events()
+    ev_usgs = usgs_events()
+    figure(ev_nwm, summ, ev_usgs)
+
+    if len(ev_nwm):
+        log.info("[NWM] median per event: rise time %.0f h, peak %.2f x 2-yr flow, "
+                 "%.0f h above threshold", ev_nwm.rise_time_h.median(),
+                 ev_nwm.peak_ratio.median(), ev_nwm.duration_above_h.median())
+    log.info("Finished. Output folder: %s", EV_DIR)
+
+
+if __name__ == "__main__":
+    main()
