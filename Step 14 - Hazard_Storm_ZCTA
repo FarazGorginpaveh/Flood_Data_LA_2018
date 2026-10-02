@@ -1,0 +1,769 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Sep 28 15:58:55 2026
+
+@author: mh01
+"""
+
+"""
+STEP 14 - Final deliverable: ALL-HAZARD events per storm x ZCTA, daily exposure,
+          data dictionary
+================================================================================
+Builds the files requested by the health team for Louisiana 2018.
+
+  hazard_events_zcta_LA_2018.csv   MAIN TABLE - one row per storm/event x ZCTA for
+                                   ANY hazard: stream flooding, stream flooding imputed
+                                   from the parish, heavy rain, coastal flooding,
+                                   tropical cyclone within 100 km
+  flood_events_zcta_LA_2018.csv    streamflow-only version (subset of the above logic)
+  zcta_daily_exposure_LA_2018.csv  every ZCTA x every day of 2018 (explicit zeros)
+  zcta_universe_LA_2018.csv        every Louisiana ZCTA and which measures it has
+  data_dictionary_LA_2018.csv      variables, descriptions, units, types, missingness
+  CONVENTIONS.md                   unit, boundary year, zero/absent/missing rules
+
+Hazard days (per ZCTA and local day)
+  streamflow      flood day from the ZCTA's own NWM reaches (step 9)
+  flood_imputed   ZCTAs without usable reaches take their MAIN PARISH's flood day
+                  (step 7); magnitude_source = "imputed (parish)"
+  heavy_rain      AORC daily rain or wettest cell-hour with return period >= 2 yr (step 12)
+  coastal         nearest tide gauge (<= 40 km) at or above NOAA minor flood level (step 13)
+  tc              tropical cyclone closest approach within 100 km, from 1 day before to
+                  1 day after (step 13)
+
+Events and storm IDs
+  * Streamflow storm-ZCTA rows keep their storm_id from step 10.
+  * Hazard days NOT already inside a streamflow storm-ZCTA window form runs per ZCTA
+    (<= 1 dry day apart). Runs are grouped when their dates overlap (+/- 1 day) and
+    their ZCTAs are <= MERGE_KM apart (or share the same tropical cyclone). A group
+    that overlaps a streamflow storm in time and space joins that storm; otherwise it
+    becomes a new hazard-only storm (IDs LA2018_H###).
+  * Key = (storm_id, zcta), unique; several runs of one ZCTA in one storm are combined.
+  * Measures (rain, coastal, cyclone) are computed for the window
+    [start_date - 1 day, end_date]; streamflow magnitude, return period and extent only
+    exist where streams flooded (or were imputed from the parish).
+  * severity_composite (OPTIONAL): mean percentile rank (0-1) of the available
+    components: return_period_p90, max_frac_reaches, length_days, rain_max_24h_mm.
+
+Inputs : data/zcta (steps 9-10), data/final (step 7), data/rain (12), data/coastal (13)
+Outputs: data/final_zcta/
+Usage  : python 14_final_event_zcta_table.py
+"""
+
+import argparse
+from pathlib import Path
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+
+# ----------------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------------
+PROJECT_DIR = Path(r"D:\Tufts\Wishlist\Sepideh_2")
+YEAR = 2018
+STATE = "LA"
+LOCAL_TZ = "America/Chicago"
+RAIN_LEAD_DAYS = 1        # storm window starts 1 day before the flood start (rain comes first)
+TC_WINDOW = (-2, 1)       # a cyclone counts for a storm-ZCTA if its closest approach is
+                          # within 2 days before the start ... 1 day after the end
+RP_BINS = [0, 2, 5, 10, 25, 50, 101]
+RP_LABELS = ["<2 yr", "2-5 yr", "5-10 yr", "10-25 yr", "25-50 yr", ">=50 yr"]
+TC_EVENT_KM = 100         # a tropical cyclone is a hazard within 100 km ...
+TC_EVENT_DAYS = 1         # ... from 1 day before to 1 day after closest approach
+MERGE_KM = 150            # hazard runs / storms closer than this can be one storm
+GAP_DAYS = 1              # hazard days <= 1 dry day apart = one run
+FLOOD_ORDER = {"none": 0, "minor": 1, "moderate": 2, "major": 3}
+INV_FLOOD = {v: k for k, v in FLOOD_ORDER.items()}
+
+
+def set_paths(project_dir):
+    global D, OUT
+    D = project_dir / "data"
+    OUT = D / "final_zcta"
+    OUT.mkdir(parents=True, exist_ok=True)
+
+
+def day(x):
+    return pd.to_datetime(pd.Series(x).astype(str).str[:10], errors="coerce")
+
+
+# ----------------------------------------------------------------------------
+# 1. ONE ROW PER STORM x ZCTA
+# ----------------------------------------------------------------------------
+def storm_zcta_rows(ev):
+    ev = ev.copy()
+    ev["s"], ev["e"], ev["p"] = day(ev.start_date), day(ev.end_date), day(ev.peak_day)
+    rows = []
+    for (sid, zc), g in ev.groupby(["storm_id", "zcta"], sort=False):
+        top = g.loc[g.magnitude_best.fillna(-1).idxmax()]
+        s, e = g.s.min(), g.e.max()
+        rows.append({
+            "storm_id": sid, "zcta": zc,
+            "main_parish_fips": top.get("main_parish_fips"),
+            "main_parish_name": top.get("main_parish_name"),
+            "start_date": s.date(), "end_date": e.date(), "peak_date": top.p.date(),
+            "length_days": (e - s).days + 1,
+            "n_flood_events_combined": len(g),
+            "magnitude_best": g.magnitude_best.max(),
+            "magnitude_source": ("observed (USGS)" if (g.magnitude_source == "observed (USGS)").any()
+                                 else top.magnitude_source),
+            "magnitude_modeled": g.magnitude_modeled.max(),
+            "magnitude_observed": g.magnitude_observed.max(),
+            "return_period_p90": g.return_period_p90.max(),
+            "return_period_max": g.return_period_max.max(),
+            "onset_to_peak_h": g.duration_median_rise_h.median(),
+            "severity_max_norm": g.severity_max_norm.max(),
+            "max_frac_reaches": g.max_frac_reaches.max(),
+            "max_reaches_flooding": g.max_reaches_flooding.max(),
+            "observed_stage_above_flood_ft": g.observed_stage_above_flood_ft.max()
+            if "observed_stage_above_flood_ft" in g else np.nan,
+            "usgs_gauges": ";".join(sorted(set(";".join(g.usgs_gauges.fillna("")).split(";")) - {""}))
+            if "usgs_gauges" in g else "",
+            "confidence": top.confidence,
+        })
+    out = pd.DataFrame(rows)
+    out["return_period_class"] = pd.cut(out.return_period_p90, RP_BINS, labels=RP_LABELS, right=False)
+    return out
+
+
+# ----------------------------------------------------------------------------
+# 2. RAINFALL, COASTAL, HURRICANE FOR EACH STORM x ZCTA WINDOW
+# ----------------------------------------------------------------------------
+def add_rain(t, rain_h, rain_d):
+    if rain_h is None:
+        return t
+    from importlib import util  # noqa: F401  (keeps the import block simple)
+    h = rain_h.copy()
+    tl = pd.to_datetime(h.time_utc).dt.tz_localize("UTC") - pd.Timedelta(minutes=30)
+    h["tloc"] = tl.dt.tz_convert(LOCAL_TZ).dt.tz_localize(None)
+    h = h.sort_values(["zcta", "tloc"])
+    h["roll24"] = h.groupby("zcta").rain_mean_mm.transform(lambda s: s.rolling(24, min_periods=1).sum())
+    grp = {k: g for k, g in h.groupby("zcta")}
+    a14 = None
+    ap = D / "rain" / "atlas14_zcta.csv"
+    if ap.exists():
+        a14 = pd.read_csv(ap, dtype={"zcta": str})
+    tot, m24, m1, m1c, rp24, rp1 = [], [], [], [], [], []
+    for zc, s, e in zip(t.zcta, day(t.start_date), day(t.end_date)):
+        g = grp.get(zc)
+        if g is None:
+            for L in (tot, m24, m1, m1c):
+                L.append(np.nan)
+            continue
+        w = g[(g.tloc >= s - pd.Timedelta(days=RAIN_LEAD_DAYS)) & (g.tloc < e + pd.Timedelta(days=1))]
+        tot.append(w.rain_mean_mm.sum())
+        m24.append(w.roll24.max() if len(w) else np.nan)
+        m1.append(w.rain_mean_mm.max() if len(w) else np.nan)
+        m1c.append(w.rain_max_cell_mm.max() if len(w) else np.nan)
+    t["rain_event_total_mm"] = np.round(tot, 1)
+    t["rain_max_24h_mm"] = np.round(m24, 1)
+    t["rain_max_1h_mm"] = np.round(m1, 2)
+    t["rain_max_1h_cell_mm"] = np.round(m1c, 2)
+    if a14 is not None and len(a14):
+        tab = {}
+        for (zc, dur), g in a14.groupby(["zcta", "duration"]):
+            g = g.sort_values("ari_yr")
+            if len(g) >= 2 and (g.depth_mm > 0).all():
+                tab[(zc, dur)] = (np.log(g.ari_yr.to_numpy()), np.log(g.depth_mm.to_numpy()))
+
+        def rp(zcs, vals, dur):
+            out = []
+            for zc, x in zip(zcs, vals):
+                k = tab.get((zc, dur))
+                if k is None or not np.isfinite(x):
+                    out.append(np.nan)
+                elif x <= 0:
+                    out.append(1.0)
+                else:
+                    out.append(float(np.exp(np.interp(np.log(x), k[1], k[0], left=k[0][0], right=k[0][-1]))))
+            return np.round(np.clip(out, 1, 1000), 2)
+        t["rain_rp_24h"] = rp(t.zcta, t.rain_max_24h_mm, "24h")
+        t["rain_rp_1h_cell"] = rp(t.zcta, t.rain_max_1h_cell_mm, "1h")
+    return t
+
+
+def add_coastal(t, cd):
+    if cd is None or cd.empty:
+        t["coastal_wl_max_m_mhhw"] = np.nan
+        t["coastal_flood_class"] = pd.NA
+        t["coastal_report"] = ""
+        return t
+    cd = cd.copy()
+    cd["date"] = day(cd.date)
+    grp = {k: g for k, g in cd.groupby("zcta")}
+    wl, cls, rep = [], [], []
+    for zc, s, e in zip(t.zcta, day(t.start_date), day(t.end_date)):
+        g = grp.get(zc)
+        if g is None:
+            wl.append(np.nan); cls.append(pd.NA); rep.append("")
+            continue
+        w = g[(g.date >= s - pd.Timedelta(days=RAIN_LEAD_DAYS)) & (g.date <= e)]
+        has_gauge = "wl_max_m_mhhw" in w and w.wl_max_m_mhhw.notna().any()
+        wl.append(w.wl_max_m_mhhw.max() if has_gauge else np.nan)
+        if has_gauge:
+            cls.append(INV_FLOOD[int(w.coastal_flood_class.fillna("none").map(FLOOD_ORDER).max())])
+        else:
+            cls.append(pd.NA)
+        rep.append(";".join(sorted(set(";".join(w.get("coastal_report", pd.Series(dtype=str))
+                                                  .fillna("").astype(str)).split(";")) - {""})))
+    t["coastal_wl_max_m_mhhw"] = np.round(pd.to_numeric(pd.Series(wl), errors="coerce"), 3)
+    t["coastal_flood_class"] = cls
+    t["coastal_report"] = rep
+    return t
+
+
+def add_hurricane(t, hur):
+    cols = ["tc_name", "tc_nhc_id", "tc_dist_km", "tc_wind_kt", "tc_category", "tc_rain_mm"]
+    if hur is None or hur.empty:
+        for c in cols:
+            t[c] = np.nan
+        return t
+    hur = hur.copy()
+    hur["cd"] = day(hur.closest_date_local)
+    grp = {k: g for k, g in hur.groupby("zcta")}
+    rows = []
+    for zc, s, e in zip(t.zcta, day(t.start_date), day(t.end_date)):
+        g = grp.get(zc)
+        m = g[(g.cd >= s + pd.Timedelta(days=TC_WINDOW[0])) & (g.cd <= e + pd.Timedelta(days=TC_WINDOW[1]))] \
+            if g is not None else None
+        if m is None or m.empty:
+            rows.append([np.nan] * len(cols))
+            continue
+        r = m.sort_values("dist_km").iloc[0]
+        rows.append([r.storm_name, r.nhc_id, r.dist_km, r.storm_wind_kt, r.storm_category,
+                     r.get("storm_rain_mm", np.nan)])
+    t[cols] = pd.DataFrame(rows, columns=cols, index=t.index)
+    return t
+
+
+def composite(t):
+    parts = []
+    for c in ("return_period_p90", "max_frac_reaches", "length_days", "rain_max_24h_mm"):
+        if c in t and t[c].notna().any():
+            parts.append(t[c].rank(pct=True))
+    return pd.concat(parts, axis=1).mean(axis=1).round(3) if parts else np.nan
+
+
+# ----------------------------------------------------------------------------
+# 3. DATA DICTIONARY
+# ----------------------------------------------------------------------------
+BLANK = "blank = not available"
+DICT = {
+    # ---- main table ----
+    "storm_id": ("Storm/event ID; one weather system = one ID across ZCTAs", "-", "text", "never missing"),
+    "zcta": ("ZIP Code Tabulation Area (2020 Census boundaries), 5 characters", "-", "text", "never missing"),
+    "main_parish_fips": ("County (parish) FIPS holding most of the ZCTA's land", "-", "text", BLANK),
+    "main_parish_name": ("Name of that parish", "-", "text", BLANK),
+    "start_date": ("First local day of streamflow flooding in the ZCTA during this storm", "date", "YYYY-MM-DD", "never missing"),
+    "end_date": ("Last local day of streamflow flooding in the ZCTA during this storm", "date", "YYYY-MM-DD", "never missing"),
+    "peak_date": ("Local day of the largest flood peak in the ZCTA", "date", "YYYY-MM-DD", BLANK),
+    "length_days": ("Flooding duration: end_date - start_date + 1", "days", "integer", "never missing"),
+    "n_flood_events_combined": ("Number of ZCTA flood events combined into this storm-ZCTA row", "count", "integer", "never missing"),
+    "event_type": ("tropical cyclone / heavy rainfall - flash flooding / heavy rainfall - river flooding / heavy rainfall - not reported", "-", "category", "never missing"),
+    "event_type_basis": ("Evidence for event_type (HURDAT2 track, Storm Events cause or type, streamflow only)", "-", "category", "never missing"),
+    "magnitude_best": ("Flood magnitude: largest peak flow / 2-year flow (1 = threshold; capped at 10); observed if available, else modeled", "ratio", "number", BLANK + " (no reach peak in the window)"),
+    "magnitude_source": ("Source of magnitude_best: observed (USGS) / modeled (NWM) / none; 'imputed' reserved, not used", "-", "category", "never missing"),
+    "magnitude_modeled": ("NWM peak / 2-year flow (capped at 10)", "ratio", "number", BLANK),
+    "magnitude_observed": ("USGS gauge peak / 2-year flow (capped at 10), if a usable gauge in the ZCTA flooded", "ratio", "number", "blank = no usable gauge flooded"),
+    "return_period_p90": ("Robust return period: 90th percentile of the return periods of the reach peaks (Gumbel fit to 1980-2022 NWM annual maxima)", "years", "number (1-100)", BLANK),
+    "return_period_class": ("Class of return_period_p90", "-", "category", BLANK),
+    "return_period_max": ("Largest single-reach return period (capped at 100; often hits the cap)", "years", "number (1-100)", BLANK),
+    "onset_to_peak_h": ("Time from flood onset (threshold crossing) to peak, median over the ZCTA's reach events", "hours", "number", BLANK),
+    "severity_max_norm": ("Severity: peak ratio / onset-to-peak time (largest reach value)", "per hour", "number", BLANK),
+    "max_frac_reaches": ("Extent proxy: largest share of the ZCTA's stream reaches above the 2-year flow on one day (NOT area)", "fraction 0-1", "number", "never missing"),
+    "max_reaches_flooding": ("Largest number of the ZCTA's reaches above the 2-year flow on one day", "count", "integer", "never missing"),
+    "n_reaches": ("Usable NWM stream reaches in the ZCTA (reliability indicator)", "count", "integer", "never missing"),
+    "observed_stage_above_flood_ft": ("USGS stage above NWS flood stage, if a stage gauge in the ZCTA flooded", "feet", "number", "blank = no such gauge"),
+    "usgs_gauges": ("USGS gauges in the ZCTA that flooded during the storm", "-", "text; ';'-separated", "blank = none"),
+    "confidence": ("Reliability of the flood measures: high / medium / low (parish evaluation; urban ZCTAs one level lower)", "-", "category", "never missing"),
+    "rain_event_total_mm": ("ZCTA areal-mean rainfall from start_date - 1 day to end_date (AORC v1.1)", "mm", "number", "blank = rainfall not processed"),
+    "rain_max_24h_mm": ("Largest 24-hour areal-mean rainfall in that window", "mm", "number", "blank = rainfall not processed"),
+    "rain_max_1h_mm": ("Largest 1-hour areal-mean rainfall in that window", "mm", "number", "blank = rainfall not processed"),
+    "rain_max_1h_cell_mm": ("Largest 1-hour rainfall at any ~800 m cell in the ZCTA in that window", "mm", "number", "blank = rainfall not processed"),
+    "rain_rp_24h": ("Return period of rain_max_24h_mm vs NOAA Atlas 14 24-h point depths (conservative for large ZCTAs)", "years", "number (1-1000)", "blank = Atlas 14 unavailable"),
+    "rain_rp_1h_cell": ("Return period of rain_max_1h_cell_mm vs NOAA Atlas 14 1-h point depths", "years", "number (1-1000)", "blank = Atlas 14 unavailable"),
+    "coastal_wl_max_m_mhhw": ("Highest daily-max water level at the nearest tide gauge (within 40 km) in the window, above MHHW", "m", "number", "blank = no tide gauge within 40 km"),
+    "coastal_flood_class": ("Coastal flooding at that gauge: none / minor / moderate / major (NOAA NOS CO-OPS 086 thresholds)", "-", "category", "blank = no tide gauge within 40 km"),
+    "coastal_report": ("NWS Coastal Flood / Storm Surge reports in the ZCTA's main parish during the window", "-", "text", "blank = none"),
+    "tc_name": ("Tropical cyclone whose closest approach fell within the storm window (HURDAT2)", "-", "text", "blank = no tropical cyclone within 500 km"),
+    "tc_nhc_id": ("NHC storm ID of that cyclone", "-", "text", "blank = none"),
+    "tc_dist_km": ("Closest distance of the cyclone centre to the ZCTA centroid", "km", "number", "blank = none"),
+    "tc_wind_kt": ("Cyclone maximum sustained wind at closest approach (storm intensity, not local wind)", "knots", "number", "blank = none"),
+    "tc_category": ("Saffir-Simpson category at closest approach", "-", "category", "blank = none"),
+    "tc_rain_mm": ("ZCTA rainfall from 2 days before to 1 day after closest approach", "mm", "number", "blank = none or rainfall not processed"),
+    "storm_start_date": ("First flood day of the whole storm (any ZCTA)", "date", "YYYY-MM-DD", "never missing"),
+    "storm_end_date": ("Last flood day of the whole storm", "date", "YYYY-MM-DD", "never missing"),
+    "storm_peak_day": ("Main day of the storm: day with the most ZCTA peaks", "date", "YYYY-MM-DD", "never missing"),
+    "storm_n_zctas": ("Number of ZCTAs flooded in the storm", "count", "integer", "never missing"),
+    "storm_zctas": ("All ZCTAs flooded in the storm", "-", "text; ';'-separated", "never missing"),
+    "storm_n_parishes": ("Number of parishes flooded in the storm", "count", "integer", "never missing"),
+    "storm_parishes": ("FIPS codes of those parishes", "-", "text; ';'-separated", "never missing"),
+    "storm_parish_names": ("Names of those parishes", "-", "text; ';'-separated", "never missing"),
+    "severity_composite": ("OPTIONAL suggested composite: mean percentile rank (0-1) of return_period_p90, max_frac_reaches, length_days, rain_max_24h_mm", "0-1", "number", BLANK),
+    # ---- daily table ----
+    "date": ("Local calendar day (America/Chicago)", "date", "YYYY-MM-DD", "never missing"),
+    "data_status": ("included / no data: unverified parish / no data: fewer than 5 reaches", "-", "category", "never missing"),
+    "flood_day": ("Streamflow flood day in the ZCTA (>= 2 reaches and >= 2% of reaches above the 2-year flow)", "-", "0/1", "blank = no data (see data_status)"),
+    "flood_magnitude": ("Largest peak / 2-year flow among reach events peaking that day", "ratio", "number", "0 on non-flood days; blank = no data"),
+    "reaches_flooding": ("Reaches above the 2-year flow that day", "count", "integer", "blank = no data"),
+    "frac_flooding": ("Share of the ZCTA's reaches above the 2-year flow that day", "fraction 0-1", "number", "blank = no data"),
+    "in_storm_id": ("storm_id if the day falls inside a storm-ZCTA window of the main table", "-", "text", "blank = not in a storm"),
+    "rain_total_mm": ("Areal-mean daily rainfall", "mm", "number", "blank = rainfall not processed"),
+    "rain_max_1h_cell_mm_day": ("Largest 1-hour rainfall at any cell that day", "mm", "number", "blank = rainfall not processed"),
+    "heavy_rain_day": ("Daily rainfall or wettest cell-hour with a return period >= 2 years (possible pluvial / urban flooding)", "-", "0/1", "blank = rainfall not processed"),
+    "coastal_flood_class_day": ("Tide-gauge coastal flood class that day", "-", "category", "blank = no tide gauge within 40 km"),
+    "tc_within_250km": ("A tropical cyclone's closest approach within 250 km happened that day", "-", "0/1", "never missing"),
+    # ---- universe ----
+    "n_storm_zcta_rows": ("Rows of this ZCTA in the main table", "count", "integer", "never missing"),
+    "urban": ("More than half of the ZCTA's land is Census urban area", "-", "0/1", BLANK),
+    # ---- all-hazard additions ----
+    "hazards": ("Hazards that occurred in the ZCTA during this storm window: streamflow, flood_imputed, heavy_rain, coastal, tc", "-", "text; ';'-separated", "never missing"),
+    "hazard_streamflow": ("Stream flooding from the ZCTA's own reaches", "-", "0/1", "never missing"),
+    "hazard_flood_imputed": ("Stream flooding imputed from the main parish (ZCTA without usable reaches)", "-", "0/1", "never missing"),
+    "hazard_heavy_rain": ("At least one heavy-rain day (return period >= 2 yr)", "-", "0/1", "never missing"),
+    "hazard_coastal": ("At least one day at or above the minor coastal flood level at the nearest tide gauge", "-", "0/1", "never missing (0 also where no gauge; see has_tide_gauge)"),
+    "hazard_tc": ("Tropical cyclone closest approach within 100 km (+/- 1 day)", "-", "0/1", "never missing"),
+    "storm_origin": ("streamflow storm (from step 10) or hazard-only storm (no stream flooding in the storm)", "-", "category", "never missing"),
+    "flood_day_filled": ("flood_day, or the main parish's flood day for ZCTAs without usable reaches", "-", "0/1", "blank = no data (unverified parish)"),
+    "flood_source": ("Source of flood_day_filled: ZCTA reaches / imputed (parish) / missing", "-", "category", "never missing"),
+    "flood_magnitude_filled": ("flood_magnitude, or the parish magnitude when imputed", "ratio", "number", "0 on non-flood days; blank = no data"),
+    "coastal_hazard_day": ("Tide-gauge water level at or above the minor flood level that day", "-", "0/1", "blank = no tide gauge within 40 km"),
+    "tc_event_day": ("Tropical cyclone within 100 km, from 1 day before to 1 day after closest approach", "-", "0/1", "never missing"),
+    "any_hazard_day": ("Any of: flood_day_filled, heavy_rain_day, coastal_hazard_day, tc_event_day", "-", "0/1", "never missing"),
+    "streamflow_status": ("ZCTA reaches / imputed from parish / missing (unverified parish)", "-", "category", "never missing"),
+    "has_tide_gauge": ("A tide gauge within 40 km provides coastal flooding", "-", "0/1", "never missing"),
+    "n_hazard_rows": ("Rows of this ZCTA in the all-hazard main table", "count", "integer", "never missing"),
+}
+
+
+def dictionary(tables):
+    rows = []
+    for tname, df in tables.items():
+        for c in df.columns:
+            desc, unit, typ, miss = DICT.get(c, ("(see README column guide)", "-", str(df[c].dtype), BLANK))
+            rows.append({"table": tname, "variable": c, "description": desc, "unit": unit,
+                         "type_or_format": typ, "missingness": miss,
+                         "pct_missing": round(100 * df[c].isna().mean(), 1)})
+    return pd.DataFrame(rows)
+
+
+CONVENTIONS = """# Conventions - Louisiana {year} flood / hazard exposure dataset
+
+**Spatial unit:** ZIP Code Tabulation Area (ZCTA), **2020 U.S. Census boundaries**
+(cb_2020_us_zcta520_500k). ZCTAs are linked to the parish (county) holding most of
+their land. A parish-level version is in data/final.
+
+**Temporal unit:** local calendar day, **America/Chicago** (raw times in UTC).
+
+**Main table** (hazard_events_zcta_LA_{year}.csv): one row per **storm x ZCTA** for any
+hazard; key = (storm_id, zcta), unique. `flood_events_zcta_LA_{year}.csv` holds the
+streamflow-only rows.
+
+**Zero / absent / missing convention**
+- A ZCTA **absent** from the main table for a storm had **no hazard** in that storm,
+  subject to what can be measured there (see zcta_universe_LA_{year}.csv):
+  - stream flooding: measured if `streamflow_status` = "ZCTA reaches" or
+    "imputed from parish"; **missing** if "missing (unverified parish)";
+  - rainfall and tropical cyclones: measured for **every** ZCTA;
+  - coastal flooding: measured only where `has_tide_gauge` = 1.
+- In the daily table, 0 = hazard measured and absent; **blank = not measured / missing**.
+- In all CSV files a **blank cell = missing / not applicable**; the reason is given in
+  the `missingness` column of the data dictionary. No numeric codes such as -999.
+
+**Sources of the magnitude:** `magnitude_source` = observed (USGS) / modeled (NWM) /
+imputed (parish) / none (hazard without stream flooding).
+
+**Limitations:** stream flooding is riverine (NOAA National Water Model v3.0
+retrospective); urban drainage flooding is under-represented (use the rainfall
+variables); coastal flooding only near tide gauges; `max_frac_reaches` is an extent
+proxy, not flooded area; flood depth is not included.
+"""
+
+
+# ----------------------------------------------------------------------------
+# 4. IMPUTATION AND HAZARD DAYS
+# ----------------------------------------------------------------------------
+def parish_imputation(u):
+    """Main-parish flood days for ZCTAs without usable reaches."""
+    pdaily = pd.read_csv(D / "final" / "parish_daily_2018.csv",
+                         dtype={"parish_fips": str, "flood_day": "boolean"})
+    pdaily["date"] = day(pdaily.date)
+    pdaily = pdaily[pdaily.source != "none"]
+    need = u[u.data_status != "included"][["zcta", "main_parish_fips"]]
+    x = need.merge(pdaily[["parish_fips", "date", "flood_day", "magnitude_peak_ratio",
+                           "duration_rise_h", "severity_norm", "nwm_frac_flooding"]],
+                   left_on="main_parish_fips", right_on="parish_fips", how="inner")
+    return x.drop(columns=["parish_fips"])
+
+
+def hazard_runs(hd, covered):
+    """Runs of hazard days per ZCTA, excluding days inside streamflow windows."""
+    hd = hd[~pd.Series(list(zip(hd.zcta, hd.date)), index=hd.index).isin(covered)]
+    runs = []
+    for zc, g in hd.sort_values("date").groupby("zcta"):
+        start = prev = None
+        acc = []
+        for _, r in g.iterrows():
+            if start is not None and (r.date - prev).days <= GAP_DAYS + 1:
+                prev = r.date
+                acc.append(r)
+                continue
+            if start is not None:
+                runs.append((zc, start, prev, acc))
+            start = prev = r.date
+            acc = [r]
+        if start is not None:
+            runs.append((zc, start, prev, acc))
+    rows = []
+    for zc, s, e, acc in runs:
+        a = pd.DataFrame(acc)
+        rows.append({"zcta": zc, "start": s, "end": e,
+                     "hazard_flood_imputed": int(a.imp.any()), "hazard_heavy_rain": int(a.rain.any()),
+                     "hazard_coastal": int(a.coast.any()), "hazard_tc": int(a.tc.any()),
+                     "tc_names": ";".join(sorted(set(";".join(a.tc_name.fillna("")).split(";")) - {""}))})
+    return pd.DataFrame(rows)
+
+
+def group_runs(runs, cent, storms_geo):
+    """Group hazard runs into storms; attach to overlapping streamflow storms."""
+    n = len(runs)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    lat = runs.zcta.map(cent.y).to_numpy()
+    lon = runs.zcta.map(cent.x).to_numpy()
+    tol = pd.Timedelta(days=1)
+    s, e = runs.start.to_numpy(), runs.end.to_numpy()
+    for i in range(n):
+        ov = (runs.start <= runs.end.iloc[i] + tol) & (runs.end >= runs.start.iloc[i] - tol)
+        idx = np.flatnonzero(ov.to_numpy())
+        idx = idx[idx > i]
+        if not len(idx):
+            continue
+        dkm = haversine(lat[i], lon[i], lat[idx], lon[idx])
+        same_tc = np.array([bool(runs.tc_names.iloc[i]) and runs.tc_names.iloc[i] == runs.tc_names.iloc[j]
+                            for j in idx])
+        for j in idx[(dkm <= MERGE_KM) | same_tc]:
+            ri, rj = find(i), find(j)
+            if ri != rj:
+                parent[rj] = ri
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    sid = np.empty(n, dtype=object)
+    new_k = 0
+    for members in sorted(groups.values(), key=lambda m: runs.start.iloc[m].min()):
+        gs, ge = runs.start.iloc[members].min(), runs.end.iloc[members].max()
+        glat, glon = lat[members], lon[members]
+        best, best_ov = None, 0
+        for st_id, (ss, se, slat, slon) in storms_geo.items():
+            ovd = (min(ge, se + tol) - max(gs, ss - tol)).days
+            if ovd < 0:
+                continue
+            dmin = np.nanmin(haversine(glat[:, None], glon[:, None], slat[None, :], slon[None, :]))
+            if dmin <= MERGE_KM and ovd + 1 > best_ov:
+                best, best_ov = st_id, ovd + 1
+        if best is None:
+            new_k += 1
+            best = f"LA{YEAR}_H{new_k:03d}"
+        for i in members:
+            sid[i] = best
+    return sid
+
+
+def haversine(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(np.radians, (lat1, lon1, lat2, lon2))
+    a = (np.sin((lat2 - lat1) / 2) ** 2
+         + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2)
+    return 6371 * 2 * np.arcsin(np.sqrt(a))
+
+
+# ----------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project-dir", default=str(PROJECT_DIR))
+    args = ap.parse_args()
+    set_paths(Path(args.project_dir))
+    Z = D / "zcta"
+
+    ev = pd.read_csv(Z / "zcta_events_2018_enriched.csv", dtype={"zcta": str, "main_parish_fips": str})
+    ann = pd.read_csv(Z / "zcta_annual_2018.csv", dtype={"zcta": str, "main_parish_fips": str})
+    storms = pd.read_csv(Z / "storms_2018.csv", dtype={"zctas": str, "parishes": str})
+    zb = gpd.read_file(Z / "zcta_boundaries_LA.gpkg")
+    zb["zcta"] = zb.zcta.astype(str)
+    cent = zb.set_index("zcta").geometry.to_crs(3857).centroid.to_crs(4326)
+
+    rh_p, rd_p = D / "rain" / f"zcta_rain_hourly_{YEAR}.parquet", D / "rain" / f"zcta_rain_daily_{YEAR}.csv"
+    cd_p, hu_p = D / "coastal" / f"zcta_coastal_daily_{YEAR}.csv", D / "coastal" / f"hurricane_zcta_{YEAR}.csv"
+    rain_h = pd.read_parquet(rh_p) if rh_p.exists() else None
+    rain_d = pd.read_csv(rd_p, dtype={"zcta": str}) if rd_p.exists() else None
+    coast = pd.read_csv(cd_p, dtype={"zcta": str, "station_id": str}) if cd_p.exists() else None
+    hur = pd.read_csv(hu_p, dtype={"zcta": str}) if hu_p.exists() else None
+    for name, obj in (("rainfall (step 12)", rain_h), ("coastal (step 13)", coast),
+                      ("hurricanes (step 13)", hur)):
+        if obj is None:
+            print(f"  ! {name} not found - those hazards and columns will be blank")
+    if rain_h is not None:
+        rain_h["zcta"] = rain_h.zcta.astype(str)
+
+    # ---- universe ------------------------------------------------------------------
+    u = ann[["zcta", "main_parish_fips", "main_parish_name", "n_reaches", "urban", "confidence"]].copy()
+    reason = ann.get("no_data_reason", pd.Series("", index=ann.index)).fillna("")
+    u["data_status"] = np.where(ann.confidence == "no data",
+                                np.where(reason.str.contains("unverified"), "no data: unverified parish",
+                                         "no data: fewer than 5 reaches"), "included")
+
+    # ---- B. parish imputation -----------------------------------------------------------
+    imp = parish_imputation(u)
+    imp_z = set(imp.zcta)
+    u["streamflow_status"] = np.select(
+        [u.data_status == "included", u.zcta.isin(imp_z)],
+        ["ZCTA reaches", "imputed from parish"], "missing (unverified parish)")
+
+    # ---- daily exposure ----------------------------------------------------------------
+    zd = pd.read_csv(Z / "zcta_daily_2018.csv", dtype={"zcta": str, "flood_day": "boolean"})
+    daily = zd[["zcta", "date", "flood_day", "magnitude_peak_ratio", "reaches_flooding",
+                "frac_flooding"]].rename(columns={"magnitude_peak_ratio": "flood_magnitude"})
+    daily["date"] = day(daily.date)
+    daily = daily.merge(u[["zcta", "data_status", "streamflow_status"]], on="zcta", how="left")
+    nd = daily.data_status != "included"
+    daily["flood_day"] = daily.flood_day.astype("Int64")
+    daily.loc[nd, ["flood_day", "reaches_flooding", "frac_flooding"]] = pd.NA
+    daily["flood_magnitude"] = daily.flood_magnitude.where(daily.flood_day.fillna(0) == 1, 0.0)
+    daily.loc[nd, "flood_magnitude"] = np.nan
+    im = imp.rename(columns={"flood_day": "imp_day", "magnitude_peak_ratio": "imp_mag"})
+    daily = daily.merge(im[["zcta", "date", "imp_day", "imp_mag"]], on=["zcta", "date"], how="left")
+    imp_day = daily.imp_day.fillna(False).astype(bool).astype(int)
+    daily["flood_day_filled"] = daily.flood_day
+    isimp = daily.streamflow_status == "imputed from parish"
+    daily.loc[isimp, "flood_day_filled"] = imp_day[isimp]
+    daily["flood_source"] = daily.streamflow_status.map({"ZCTA reaches": "ZCTA reaches",
+                                                         "imputed from parish": "imputed (parish)"}).fillna("missing")
+    daily["flood_magnitude_filled"] = daily.flood_magnitude
+    daily.loc[isimp, "flood_magnitude_filled"] = np.where(imp_day[isimp] == 1, daily.imp_mag[isimp], 0.0)
+    daily = daily.drop(columns=["imp_day", "imp_mag"])
+    if rain_d is not None:
+        r = rain_d.rename(columns={"rain_max_1h_cell_mm": "rain_max_1h_cell_mm_day"})
+        r["date"] = day(r.date)
+        daily = daily.merge(r[["zcta", "date", "rain_total_mm", "rain_max_1h_cell_mm_day",
+                               "heavy_rain_day"]], on=["zcta", "date"], how="left")
+        daily["heavy_rain_day"] = daily.heavy_rain_day.map(
+            {True: 1, False: 0, "True": 1, "False": 0}).astype("Int64")
+    else:
+        daily["heavy_rain_day"] = pd.array([pd.NA] * len(daily), dtype="Int64")
+    gauge_z = set()
+    if coast is not None and len(coast) and "coastal_flood_class" in coast:
+        c = coast[["zcta", "date", "coastal_flood_class"]].dropna(subset=["coastal_flood_class"])
+        gauge_z = set(c.zcta)
+        c = c.rename(columns={"coastal_flood_class": "coastal_flood_class_day"})
+        c["date"] = day(c.date)
+        daily = daily.merge(c.drop_duplicates(["zcta", "date"]), on=["zcta", "date"], how="left")
+        cls = daily.coastal_flood_class_day
+        daily["coastal_hazard_day"] = pd.array(
+            np.where(cls.isna(), pd.NA, cls.isin(["minor", "moderate", "major"]).astype(int)), dtype="Int64")
+    else:
+        daily["coastal_flood_class_day"] = pd.NA
+        daily["coastal_hazard_day"] = pd.array([pd.NA] * len(daily), dtype="Int64")
+    daily["tc_within_250km"] = 0
+    daily["tc_event_day"] = 0
+    daily["tc_name_day"] = ""
+    if hur is not None and len(hur):
+        hur["cd"] = day(hur.closest_date_local)
+        tc250 = set(zip(hur.zcta[hur.dist_km <= 250], hur.cd[hur.dist_km <= 250]))
+        daily["tc_within_250km"] = [int((z_, d_) in tc250) for z_, d_ in zip(daily.zcta, daily.date)]
+        near = hur[hur.dist_km <= TC_EVENT_KM]
+        tcd = {}
+        for zc, cdt, nm in zip(near.zcta, near.cd, near.storm_name):
+            for k in range(-TC_EVENT_DAYS, TC_EVENT_DAYS + 1):
+                tcd.setdefault((zc, cdt + pd.Timedelta(days=k)), set()).add(nm)
+        key = list(zip(daily.zcta, daily.date))
+        daily["tc_event_day"] = [int(k in tcd) for k in key]
+        daily["tc_name_day"] = [";".join(sorted(tcd.get(k, ()))) for k in key]
+    daily["any_hazard_day"] = ((daily.flood_day_filled.fillna(0) == 1) | (daily.heavy_rain_day.fillna(0) == 1)
+                               | (daily.coastal_hazard_day.fillna(0) == 1) | (daily.tc_event_day == 1)).astype(int)
+
+    # ---- streamflow storm-ZCTA rows (as before) -----------------------------------------------
+    t = storm_zcta_rows(ev)
+    t["storm_origin"] = "streamflow storm"
+    t["hazard_streamflow"] = 1
+    t["hazard_flood_imputed"] = 0
+    covered = set()
+    for zc, s, e in zip(t.zcta, day(t.start_date), day(t.end_date)):
+        for dd in pd.date_range(s, e):
+            covered.add((zc, dd))
+
+    # ---- A. hazard-only runs ---------------------------------------------------------------------
+    hd = daily.assign(imp=(daily.flood_source == "imputed (parish)") & (daily.flood_day_filled.fillna(0) == 1),
+                      rain=daily.heavy_rain_day.fillna(0) == 1,
+                      coast=daily.coastal_hazard_day.fillna(0) == 1,
+                      tc=daily.tc_event_day == 1, tc_name=daily.tc_name_day)
+    hd = hd[hd.imp | hd.rain | hd.coast | hd.tc]
+    runs = hazard_runs(hd, covered)
+    geo = {}
+    for sid_, g in t.groupby("storm_id"):
+        geo[sid_] = (day(g.start_date).min(), day(g.end_date).max(),
+                     g.zcta.map(cent.y).to_numpy(), g.zcta.map(cent.x).to_numpy())
+    if len(runs):
+        runs["storm_id"] = group_runs(runs, cent, geo)
+        new = []
+        for (sid_, zc), g in runs.groupby(["storm_id", "zcta"]):
+            new.append({"storm_id": sid_, "zcta": zc, "start_date": g.start.min().date(),
+                        "end_date": g.end.max().date(), "peak_date": g.start.min().date(),
+                        "length_days": (g.end.max() - g.start.min()).days + 1,
+                        "n_flood_events_combined": 0, "hazard_streamflow": 0,
+                        "hazard_flood_imputed": int(g.hazard_flood_imputed.max()),
+                        "storm_origin": "streamflow storm" if not str(sid_).split("_")[-1].startswith("H")
+                        else "hazard-only storm"})
+        new = pd.DataFrame(new)
+        # a ZCTA that already has a streamflow row in the same storm: merge the windows
+        both = new.merge(t[["storm_id", "zcta"]], on=["storm_id", "zcta"], how="inner")
+        for _, r in both.iterrows():
+            m = (t.storm_id == r.storm_id) & (t.zcta == r.zcta)
+            t.loc[m, "start_date"] = min(day(t.loc[m, "start_date"]).iloc[0], pd.Timestamp(r.start_date)).date()
+            t.loc[m, "end_date"] = max(day(t.loc[m, "end_date"]).iloc[0], pd.Timestamp(r.end_date)).date()
+            t.loc[m, "length_days"] = (pd.Timestamp(t.loc[m, "end_date"].iloc[0]) -
+                                       pd.Timestamp(t.loc[m, "start_date"].iloc[0])).days + 1
+        new = new.merge(t[["storm_id", "zcta"]], on=["storm_id", "zcta"], how="left", indicator=True)
+        new = new[new._merge == "left_only"].drop(columns="_merge")
+        new = new.merge(u[["zcta", "main_parish_fips", "main_parish_name", "confidence"]], on="zcta", how="left")
+        # imputed flood magnitude from the parish
+        if len(new) and new.hazard_flood_imputed.any():
+            ii = imp.set_index(["zcta", "date"])
+            mags, rises, sevs, fracs = [], [], [], []
+            for zc, s, e, h in zip(new.zcta, day(new.start_date), day(new.end_date), new.hazard_flood_imputed):
+                if not h:
+                    mags.append(np.nan); rises.append(np.nan); sevs.append(np.nan); fracs.append(np.nan)
+                    continue
+                w = imp[(imp.zcta == zc) & (imp.date >= s) & (imp.date <= e) & imp.flood_day.fillna(False)]
+                mags.append(w.magnitude_peak_ratio.max()); rises.append(w.duration_rise_h.median())
+                sevs.append(w.severity_norm.max()); fracs.append(w.nwm_frac_flooding.max())
+            new["magnitude_best"], new["onset_to_peak_h"] = mags, rises
+            new["severity_max_norm"], new["max_frac_reaches"] = sevs, fracs
+        new["magnitude_source"] = np.where(new.get("hazard_flood_imputed", 0) == 1, "imputed (parish)", "none")
+        new.loc[new.hazard_flood_imputed == 1, "confidence"] = "low (imputed)"
+        t = pd.concat([t, new], ignore_index=True)
+
+    # hazard flags over each row's window (for all rows)
+    hmap = hd.set_index(["zcta", "date"])
+    fl = {"hazard_heavy_rain": "rain", "hazard_coastal": "coast", "hazard_tc": "tc"}
+    for col in fl:
+        t[col] = 0
+    keys = set(hmap.index)
+    for i, (zc, s, e) in enumerate(zip(t.zcta, day(t.start_date), day(t.end_date))):
+        days = [(zc, d) for d in pd.date_range(s - pd.Timedelta(days=RAIN_LEAD_DAYS), e) if (zc, d) in keys]
+        if days:
+            sub = hmap.loc[days]
+            for col, src_ in fl.items():
+                t.iat[i, t.columns.get_loc(col)] = int(sub[src_].any())
+    t["hazards"] = [";".join(n for n, v in (("streamflow", a), ("flood_imputed", b), ("heavy_rain", c),
+                                              ("coastal", d_), ("tc", e_)) if v)
+                    for a, b, c, d_, e_ in zip(t.hazard_streamflow, t.hazard_flood_imputed,
+                                               t.hazard_heavy_rain, t.hazard_coastal, t.hazard_tc)]
+    t = t.merge(ann[["zcta", "n_reaches"]], on="zcta", how="left", suffixes=("", "_a"))
+    t = add_rain(t, rain_h, rain_d)
+    t = add_coastal(t, coast)
+    t = add_hurricane(t, hur)
+
+    # ---- storm-level columns (recomputed over all hazard rows) --------------------------------------
+    st_old = storms.set_index("storm_id")
+    pname = u.set_index("main_parish_fips").main_parish_name.to_dict()
+    srows = []
+    for sid_, g in t.groupby("storm_id"):
+        pars = sorted(set(g.main_parish_fips.dropna()))
+        if sid_ in st_old.index:
+            etype, basis = st_old.loc[sid_, "event_type"], st_old.loc[sid_, "event_type_basis"]
+        elif g.hazard_tc.any():
+            etype, basis = "tropical cyclone", "HURDAT2 track (no stream flooding)"
+        elif g.hazard_coastal.any() and not g.hazard_heavy_rain.any():
+            etype, basis = "coastal flooding", "tide gauges (no stream flooding)"
+        elif g.hazard_heavy_rain.any():
+            etype, basis = "heavy rainfall - no stream flooding", "AORC rainfall"
+        else:
+            etype, basis = "flooding - imputed from parish", "parish streamflow (imputed)"
+        srows.append({"storm_id": sid_, "event_type": etype, "event_type_basis": basis,
+                      "storm_start_date": day(g.start_date).min().date(),
+                      "storm_end_date": day(g.end_date).max().date(),
+                      "storm_peak_day": (st_old.loc[sid_, "peak_day"] if sid_ in st_old.index
+                                         else day(g.start_date).mode().min().date()),
+                      "storm_n_zctas": g.zcta.nunique(), "storm_zctas": ";".join(sorted(g.zcta)),
+                      "storm_n_parishes": len(pars), "storm_parishes": ";".join(pars),
+                      "storm_parish_names": ";".join(str(pname.get(p, p)) for p in pars)})
+    sc = pd.DataFrame(srows)
+    t = t.drop(columns=[c for c in sc.columns if c in t.columns and c != "storm_id"]).merge(sc, on="storm_id")
+    t["severity_composite"] = composite(t)
+    assert not t.duplicated(["storm_id", "zcta"]).any(), "storm_id x zcta is not unique"
+
+    rnd = {"magnitude_best": 3, "magnitude_modeled": 3, "magnitude_observed": 3,
+           "return_period_p90": 1, "return_period_max": 1, "onset_to_peak_h": 1,
+           "severity_max_norm": 3, "max_frac_reaches": 3, "tc_dist_km": 1}
+    for c, n in rnd.items():
+        if c in t:
+            t[c] = pd.to_numeric(t[c], errors="coerce").round(n)
+    order = ["storm_id", "zcta", "main_parish_fips", "main_parish_name", "storm_origin", "hazards",
+             "hazard_streamflow", "hazard_flood_imputed", "hazard_heavy_rain", "hazard_coastal", "hazard_tc",
+             "start_date", "end_date", "peak_date", "length_days", "event_type", "event_type_basis",
+             "magnitude_best", "magnitude_source", "return_period_p90", "return_period_class",
+             "max_frac_reaches", "onset_to_peak_h", "severity_max_norm", "severity_composite",
+             "rain_event_total_mm", "rain_max_24h_mm", "rain_rp_24h", "rain_max_1h_cell_mm",
+             "rain_rp_1h_cell", "coastal_flood_class", "coastal_wl_max_m_mhhw", "coastal_report",
+             "tc_name", "tc_dist_km", "tc_wind_kt", "tc_category", "tc_rain_mm", "confidence", "n_reaches"]
+    t = t[[c for c in order if c in t] + [c for c in t.columns if c not in order]]
+    t = t.sort_values(["storm_start_date", "storm_id", "zcta"])
+    t.to_csv(OUT / f"hazard_events_zcta_{STATE}_{YEAR}.csv", index=False)
+    fsub = t[t.hazard_streamflow == 1]
+    fsub.to_csv(OUT / f"flood_events_zcta_{STATE}_{YEAR}.csv", index=False)
+
+    # ---- windows -> daily, universe ----------------------------------------------------------------
+    win = []
+    for sid_, zc, s, e in zip(t.storm_id, t.zcta, day(t.start_date), day(t.end_date)):
+        for dd in pd.date_range(s, e):
+            win.append((zc, dd, sid_))
+    w = pd.DataFrame(win, columns=["zcta", "date", "in_storm_id"]).drop_duplicates(["zcta", "date"])
+    daily = daily.merge(w, on=["zcta", "date"], how="left")
+    daily["date"] = daily.date.dt.date
+    daily = daily.drop(columns=["tc_name_day"])
+    daily.to_csv(OUT / f"zcta_daily_exposure_{STATE}_{YEAR}.csv", index=False)
+
+    u["has_tide_gauge"] = u.zcta.isin(gauge_z).astype(int)
+    u["n_hazard_rows"] = u.zcta.map(t.groupby("zcta").size()).fillna(0).astype(int)
+    u["n_storm_zcta_rows"] = u.zcta.map(fsub.groupby("zcta").size()).fillna(0).astype(int)
+    u.to_csv(OUT / f"zcta_universe_{STATE}_{YEAR}.csv", index=False)
+
+    dd_ = dictionary({f"hazard_events_zcta_{STATE}_{YEAR}": t,
+                      f"zcta_daily_exposure_{STATE}_{YEAR}": daily,
+                      f"zcta_universe_{STATE}_{YEAR}": u})
+    dd_.to_csv(OUT / f"data_dictionary_{STATE}_{YEAR}.csv", index=False)
+    (OUT / "CONVENTIONS.md").write_text(CONVENTIONS.format(year=YEAR), encoding="utf-8")
+
+    # ---- summary ------------------------------------------------------------------------------------
+    print(f"\nFINAL ZCTA DATASET, {STATE} {YEAR}")
+    print(f"  ALL-HAZARD table: {len(t):,} storm-ZCTA rows, {t.storm_id.nunique()} storms, "
+          f"{t.zcta.nunique()} ZCTAs (key storm_id x zcta unique)")
+    print(f"    streamflow storms: {t[t.storm_origin == 'streamflow storm'].storm_id.nunique()}, "
+          f"hazard-only storms: {t[t.storm_origin == 'hazard-only storm'].storm_id.nunique()}")
+    for col in ("hazard_streamflow", "hazard_flood_imputed", "hazard_heavy_rain", "hazard_coastal", "hazard_tc"):
+        print(f"    rows with {col.replace('hazard_', ''):<14}: {int(t[col].sum()):,}")
+    print("    rows by magnitude source: " + ", ".join(f"{k} {v}" for k, v in t.magnitude_source.value_counts().items()))
+    print(f"  streamflow-only table: {len(fsub):,} rows")
+    print("  ZCTA universe (stream flooding): " +
+          ", ".join(f"{k} {v}" for k, v in u.streamflow_status.value_counts().items()))
+    print(f"  daily table: {len(daily):,} ZCTA-days; any-hazard days {int(daily.any_hazard_day.sum()):,}")
+    ts = t[t.hazard_tc == 1]
+    if len(ts):
+        print("  tropical-cyclone storms: " + ", ".join(
+            f"{s_} ({g.tc_name.dropna().iloc[0] if g.tc_name.notna().any() else '?'}: {len(g)} ZCTAs)"
+            for s_, g in ts.groupby("storm_id")))
+    undoc = dd_[dd_.description.str.startswith("(see README")]
+    if len(undoc):
+        print(f"  note: {len(undoc)} columns described only in the README: {', '.join(undoc.variable.unique()[:8])}")
+    print(f"Outputs in {OUT}")
+
+
+if __name__ == "__main__":
+    main()
