@@ -1,0 +1,341 @@
+"""
+STEP 12 - Rainfall per ZCTA (NOAA AORC v1.1) and how unusual it was (NOAA Atlas 14)
+===================================================================================
+Answers "was rainfall unusually heavy?" for every ZCTA and day, and gives a
+rainfall signal for urban flooding that streamflow cannot see.
+
+Data
+  AORC v1.1  hourly precipitation, ~800 m grid (30 arc-seconds), the same rainfall
+             that drives the NWM retrospective. Public, no account:
+             s3://noaa-nws-aorc-v1-1-1km/<year>.zarr  (variable APCP_surface, mm/h)
+  Atlas 14   NOAA precipitation-frequency estimates (point depths for 1-h and 24-h
+             durations and 1- to 1000-yr return periods), one request per ZCTA:
+             https://hdsc.nws.noaa.gov/cgi-bin/hdsc/new/fe_text_mean.csv
+
+What it computes
+  hourly, per ZCTA : areal-mean rainfall (mean over the grid cells inside the ZCTA)
+                     and the wettest single cell
+  daily (local)    : rain_total_mm, rain_max_1h_mm, rain_max_1h_cell_mm,
+                     rain_rp_24h  (return period of the daily areal total, 24-h Atlas 14)
+                     rain_rp_1h_cell (return period of the wettest cell-hour, 1-h Atlas 14)
+                     heavy_rain_day (either return period >= HEAVY_RP years)
+
+Notes
+  * Atlas 14 values are POINT estimates. An areal mean over a whole ZCTA is lower
+    than the wettest point, so rain_rp_24h is conservative for large ZCTAs.
+    rain_rp_1h_cell compares a cell (~0.7 km2) with a point, which is closer.
+  * AORC times are UTC and mark the END of each hour; days are local
+    (America/Chicago), like the rest of the dataset.
+
+Outputs (data/rain/)
+  zcta_rain_hourly_2018.parquet, zcta_rain_daily_2018.csv, atlas14_zcta.csv,
+  figures/fig16_rain_2018.png
+Usage : python 12_rainfall_aorc.py          (resumable; ~a few GB are read from AWS)
+Needs : step 9 (data/zcta/zcta_boundaries_LA.gpkg)
+"""
+
+import argparse
+import io
+import time
+from pathlib import Path
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+import xarray as xr
+
+# Silence the very chatty INFO messages of the AWS/S3 libraries
+# ("Skipping checksum validation ..."); they are harmless but flood the console.
+import logging as _logging
+for _name in ("botocore", "aiobotocore", "s3fs", "fsspec", "urllib3", "asyncio"):
+    _logging.getLogger(_name).setLevel(_logging.WARNING)
+
+# ----------------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------------
+PROJECT_DIR = Path(r"D:\Tufts\Wishlist\Sepideh_2")
+YEAR = 2018
+AORC_URL = "s3://noaa-nws-aorc-v1-1-1km/{year}.zarr"
+AORC_VAR = "APCP_surface"
+BBOX = (-94.10, 28.80, -88.70, 33.10)   # lon_min, lat_min, lon_max, lat_max
+LOCAL_TZ = "America/Chicago"
+PAD_DAYS = 3                             # extra days on both sides (events near Jan 1 / Dec 31)
+T_BLOCK = 144                            # hours read at once (= AORC time chunk)
+HEAVY_RP = 2                             # heavy_rain_day if a return period >= 2 years
+PFDS_URL = "https://hdsc.nws.noaa.gov/cgi-bin/hdsc/new/fe_text_mean.csv"
+PFDS_DURATIONS = {"60-min": "1h", "24-hr": "24h", "2-day": "48h", "3-day": "72h"}
+
+
+def set_paths(project_dir):
+    global D, OUT, PARTS, FIG
+    D = project_dir / "data"
+    OUT = D / "rain"
+    PARTS = OUT / "hourly_parts"
+    FIG = OUT / "figures"
+    for p in (PARTS, FIG):
+        p.mkdir(parents=True, exist_ok=True)
+
+
+# ----------------------------------------------------------------------------
+# 1. OPEN AORC
+# ----------------------------------------------------------------------------
+def open_aorc(store_fmt):
+    t0 = pd.Timestamp(f"{YEAR}-01-01", tz=LOCAL_TZ).tz_convert("UTC").tz_localize(None) \
+        - pd.Timedelta(days=PAD_DAYS)
+    t1 = pd.Timestamp(f"{YEAR + 1}-01-01", tz=LOCAL_TZ).tz_convert("UTC").tz_localize(None) \
+        + pd.Timedelta(days=PAD_DAYS)
+    parts = []
+    for y in range(t0.year, t1.year + 1):
+        url = store_fmt.format(year=y)
+        kw = {"storage_options": {"anon": True}} if url.startswith("s3://") else {}
+        try:
+            try:
+                ds = xr.open_zarr(url, consolidated=True, **kw)
+            except Exception:
+                ds = xr.open_zarr(url, consolidated=False, **kw)
+        except Exception as exc:
+            print(f"  ! could not open {url} ({str(exc)[:80]}) - skipped")
+            continue
+        latn = "latitude" if "latitude" in ds.coords else "lat"
+        lonn = "longitude" if "longitude" in ds.coords else "lon"
+        da = ds[AORC_VAR]
+        lat = ds[latn].values
+        lat_sl = slice(BBOX[1], BBOX[3]) if lat[0] < lat[-1] else slice(BBOX[3], BBOX[1])
+        da = da.sel({latn: lat_sl, lonn: slice(BBOX[0], BBOX[2])})
+        da = da.sel(time=slice(t0, t1)).rename({latn: "lat", lonn: "lon"})
+        if da.sizes["time"]:
+            parts.append(da.transpose("time", "lat", "lon"))
+    if not parts:
+        raise RuntimeError("No AORC data could be opened")
+    da = xr.concat(parts, dim="time") if len(parts) > 1 else parts[0]
+    print(f"AORC: {da.sizes['time']} hours x {da.sizes['lat']} x {da.sizes['lon']} cells")
+    return da
+
+
+# ----------------------------------------------------------------------------
+# 2. GRID CELLS -> ZCTA
+# ----------------------------------------------------------------------------
+def cell_mapping(da, z):
+    lat, lon = da["lat"].values, da["lon"].values
+    LON, LAT = np.meshgrid(lon, lat)
+    pts = gpd.GeoDataFrame({"flat": np.arange(LAT.size)},
+                           geometry=gpd.points_from_xy(LON.ravel(), LAT.ravel()), crs=4326)
+    j = gpd.sjoin(pts, z[["zcta", "geometry"]], predicate="within")[["flat", "zcta"]]
+    j = j.drop_duplicates("flat")
+    # ZCTAs too small to contain a cell centre get their nearest cell
+    missing = sorted(set(z.zcta) - set(j.zcta))
+    extra = []
+    for zc in missing:
+        p = z.loc[z.zcta == zc, "geometry"].iloc[0].representative_point()
+        iy, ix = np.abs(lat - p.y).argmin(), np.abs(lon - p.x).argmin()
+        extra.append({"flat": iy * len(lon) + ix, "zcta": zc})
+    if extra:
+        j = pd.concat([j, pd.DataFrame(extra)], ignore_index=True)
+    j = j.sort_values(["zcta", "flat"]).reset_index(drop=True)
+    zctas = j.zcta.drop_duplicates().tolist()
+    offsets = np.r_[0, np.flatnonzero(j.zcta.values[1:] != j.zcta.values[:-1]) + 1]
+    counts = np.diff(np.r_[offsets, len(j)])
+    print(f"  {len(j):,} grid cells assigned to {len(zctas)} ZCTAs "
+          f"({len(missing)} small ZCTAs use their nearest cell)")
+    return j.flat.to_numpy(), offsets, counts, zctas
+
+
+# ----------------------------------------------------------------------------
+# 3. HOURLY ZCTA RAINFALL (resumable, block by block)
+# ----------------------------------------------------------------------------
+def hourly_rain(da, flat, offsets, counts, zctas):
+    out = OUT / f"zcta_rain_hourly_{YEAR}.parquet"
+    if out.exists():
+        print("  hourly table exists - loading")
+        return pd.read_parquet(out)
+    n = da.sizes["time"]
+    times = pd.to_datetime(da["time"].values)
+    for b, t0 in enumerate(range(0, n, T_BLOCK)):
+        part = PARTS / f"block_{b:04d}.npz"
+        if part.exists():
+            continue
+        blk = da.isel(time=slice(t0, t0 + T_BLOCK)).values.astype("float32")
+        cells = np.nan_to_num(blk.reshape(blk.shape[0], -1)[:, flat], nan=0.0)
+        mean = np.add.reduceat(cells, offsets, axis=1) / counts
+        mx = np.maximum.reduceat(cells, offsets, axis=1)
+        np.savez_compressed(part, t=times[t0:t0 + T_BLOCK].values, mean=mean, mx=mx)
+        print(f"  block {b + 1}/{int(np.ceil(n / T_BLOCK))} done", end="\r")
+    print()
+    frames = []
+    for p in sorted(PARTS.glob("block_*.npz")):
+        a = np.load(p, allow_pickle=True)
+        nt = len(a["t"])
+        frames.append(pd.DataFrame({
+            "zcta": np.tile(zctas, nt),
+            "time_utc": np.repeat(pd.to_datetime(a["t"]), len(zctas)),
+            "rain_mean_mm": a["mean"].ravel().astype("float32"),
+            "rain_max_cell_mm": a["mx"].ravel().astype("float32")}))
+    h = pd.concat(frames, ignore_index=True)
+    h.to_parquet(out, index=False)
+    return h
+
+
+# ----------------------------------------------------------------------------
+# 4. NOAA ATLAS 14 PER ZCTA
+# ----------------------------------------------------------------------------
+def parse_pfds(text):
+    """Return {duration_key: (aris, depths_mm)} from a PFDS csv response."""
+    aris, res = None, {}
+    for line in text.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if not parts or not parts[0]:
+            continue
+        if "ARI" in parts[0] or "AEP" in parts[0]:
+            vals = [p for p in parts[1:] if p]
+            try:
+                aris = np.array([float(v) for v in vals])
+            except ValueError:
+                pass
+            continue
+        key = parts[0].rstrip(":")
+        if key in PFDS_DURATIONS and aris is not None:
+            vals = [p for p in parts[1:] if p][:len(aris)]
+            try:
+                res[PFDS_DURATIONS[key]] = (aris[:len(vals)], np.array([float(v) for v in vals]))
+            except ValueError:
+                pass
+    return res
+
+
+def atlas14(z, user_file=None):
+    cache = Path(user_file) if user_file else OUT / "atlas14_zcta.csv"
+    if cache.exists():
+        a = pd.read_csv(cache, dtype={"zcta": str})
+        if user_file:                       # keep a copy where step 14 looks for it
+            a.to_csv(OUT / "atlas14_zcta.csv", index=False)
+        return a
+    rows = []
+    pts = z.set_index("zcta").geometry.representative_point()
+    for k, (zc, p) in enumerate(pts.items(), 1):
+        params = {"lat": f"{p.y:.4f}", "lon": f"{p.x:.4f}", "data": "depth",
+                  "units": "metric", "series": "pds"}
+        try:
+            r = requests.get(PFDS_URL, params=params, timeout=60)
+            r.raise_for_status()
+            for dur, (aris, depths) in parse_pfds(r.text).items():
+                for a, dep in zip(aris, depths):
+                    rows.append({"zcta": zc, "duration": dur, "ari_yr": a, "depth_mm": dep})
+        except Exception as exc:
+            print(f"\n  ! Atlas 14 failed for {zc}: {str(exc)[:60]}")
+        print(f"  Atlas 14: {k}/{len(pts)} ZCTAs", end="\r")
+        time.sleep(0.3)
+    print()
+    a = pd.DataFrame(rows, columns=["zcta", "duration", "ari_yr", "depth_mm"])
+    a.to_csv(OUT / "atlas14_zcta.csv", index=False)
+    return a
+
+
+def rp_lookup(a14):
+    """{(zcta, duration): (log_ari, log_depth)} for fast interpolation."""
+    d = {}
+    for (zc, dur), g in a14.groupby(["zcta", "duration"]):
+        g = g.sort_values("ari_yr")
+        if len(g) >= 2 and (g.depth_mm > 0).all():
+            d[(zc, dur)] = (np.log(g.ari_yr.to_numpy()), np.log(g.depth_mm.to_numpy()))
+    return d
+
+
+def return_period(zctas, depths, dur, table):
+    """Log-log interpolation of depth -> return period, clipped to [1, 1000] years."""
+    out = np.full(len(depths), np.nan)
+    for i, (zc, x) in enumerate(zip(zctas, depths)):
+        t = table.get((zc, dur))
+        if t is None or not np.isfinite(x):
+            continue
+        la, ld = t
+        if x <= 0:
+            out[i] = 1.0
+            continue
+        out[i] = float(np.exp(np.interp(np.log(x), ld, la, left=la[0], right=la[-1])))
+    return np.clip(out, 1, 1000)
+
+
+# ----------------------------------------------------------------------------
+# 5. DAILY TABLE
+# ----------------------------------------------------------------------------
+def daily_table(h, table):
+    t = pd.to_datetime(h.time_utc).dt.tz_localize("UTC") - pd.Timedelta(minutes=30)
+    h = h.assign(date=t.dt.tz_convert(LOCAL_TZ).dt.tz_localize(None).dt.normalize())
+    h = h[h.date.dt.year == YEAR]
+    d = h.groupby(["zcta", "date"]).agg(
+        rain_total_mm=("rain_mean_mm", "sum"),
+        rain_max_1h_mm=("rain_mean_mm", "max"),
+        rain_max_1h_cell_mm=("rain_max_cell_mm", "max")).reset_index()
+    d["rain_rp_24h"] = return_period(d.zcta, d.rain_total_mm, "24h", table)
+    d["rain_rp_1h_cell"] = return_period(d.zcta, d.rain_max_1h_cell_mm, "1h", table)
+    d["heavy_rain_day"] = (d.rain_rp_24h >= HEAVY_RP) | (d.rain_rp_1h_cell >= HEAVY_RP)
+    for c in ("rain_total_mm", "rain_max_1h_mm", "rain_max_1h_cell_mm"):
+        d[c] = d[c].round(2)
+    for c in ("rain_rp_24h", "rain_rp_1h_cell"):
+        d[c] = d[c].round(2)
+    return d
+
+
+def figure(d, z):
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    ax = axes[0]
+    s = d.groupby("date").agg(rain=("rain_total_mm", "mean"), heavy=("heavy_rain_day", "sum"))
+    ax.bar(s.index, s.rain, width=1, color="#6baed6", label="statewide mean daily rain (mm)")
+    ax2 = ax.twinx()
+    ax2.plot(s.index, s.heavy, color="#d62728", lw=0.9, label="ZCTAs with a heavy-rain day")
+    ax.set(ylabel="mm", title=f"A. Daily rainfall and heavy-rain ZCTAs, {YEAR}")
+    ax2.set_ylabel("ZCTAs", color="#d62728")
+    ax = axes[1]
+    n = d.groupby("zcta").heavy_rain_day.sum()
+    g = z.assign(n=z.zcta.map(n).fillna(0))
+    g.plot(ax=ax, column="n", cmap="Blues", lw=0, legend=True,
+           legend_kwds={"shrink": 0.6, "label": "days"})
+    ax.set_title(f"B. Heavy-rain days per ZCTA (return period >= {HEAVY_RP} yr)")
+    ax.set_axis_off()
+    fig.tight_layout()
+    fig.savefig(FIG / "fig16_rain_2018.png", dpi=160)
+    plt.close(fig)
+
+
+# ----------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project-dir", default=str(PROJECT_DIR))
+    ap.add_argument("--aorc", default=AORC_URL, help="store pattern with {year}")
+    ap.add_argument("--atlas14-file", default=None, help="pre-built atlas14_zcta.csv")
+    args = ap.parse_args()
+    set_paths(Path(args.project_dir))
+
+    z = gpd.read_file(D / "zcta" / "zcta_boundaries_LA.gpkg")
+    z["zcta"] = z.zcta.astype(str)
+
+    h_path = OUT / f"zcta_rain_hourly_{YEAR}.parquet"
+    if h_path.exists():
+        h = pd.read_parquet(h_path)
+    else:
+        da = open_aorc(args.aorc)
+        flat, offsets, counts, zctas = cell_mapping(da, z)
+        h = hourly_rain(da, flat, offsets, counts, zctas)
+    a14 = atlas14(z, args.atlas14_file)
+    table = rp_lookup(a14)
+    print(f"  Atlas 14 available for {len({k[0] for k in table})} of {z.zcta.nunique()} ZCTAs")
+
+    d = daily_table(h, table)
+    d.to_csv(OUT / f"zcta_rain_daily_{YEAR}.csv", index=False)
+    figure(d, z)
+
+    print(f"\nRAINFALL {YEAR}: {d.zcta.nunique()} ZCTAs x {d.date.nunique()} days")
+    print(f"  mean annual rainfall (areal mean over ZCTAs): "
+          f"{d.groupby('zcta').rain_total_mm.sum().mean():,.0f} mm")
+    print(f"  ZCTA-days with heavy rain (return period >= {HEAVY_RP} yr): "
+          f"{int(d.heavy_rain_day.sum()):,}")
+    top = d.groupby("date").heavy_rain_day.sum().sort_values(ascending=False).head(5)
+    print("  days with the most heavy-rain ZCTAs: "
+          + ", ".join(f"{k:%d %b} ({v})" for k, v in top.items()))
+    print(f"Outputs in {OUT}")
+
+
+if __name__ == "__main__":
+    main()
