@@ -1,0 +1,444 @@
+"""
+STEP 13 - Hurricane exposure and coastal flooding per ZCTA
+==========================================================
+Adds the two things streamflow cannot see on the coast.
+
+A) HURRICANE / TROPICAL STORM EXPOSURE (one row per tropical cyclone x ZCTA)
+   From NOAA HURDAT2 best tracks (6-hourly, interpolated to hourly):
+     closest distance of the storm centre to the ZCTA, date of closest approach
+     (local), storm wind speed and status at that moment, Saffir-Simpson category,
+     exposure flags (within 100 / 250 km) and, if step 12 was run, the rainfall in
+     the ZCTA from 2 days before to 1 day after closest approach (the window used
+     in the widely used 'hurricaneexposure' approach).
+
+B) COASTAL FLOODING (one row per coastal ZCTA x day)
+   Observed water levels at NOAA CO-OPS tide gauges in and near Louisiana
+   (hourly heights relative to MHHW) are compared with NOAA's nationally
+   consistent flood thresholds (NOAA Technical Report NOS CO-OPS 086):
+       minor    = 0.04 x GT + 0.50 m above MHHW
+       moderate = 0.03 x GT + 0.80 m above MHHW
+       major    = 0.04 x GT + 1.17 m above MHHW      (GT = MHHW - MLLW)
+   Each ZCTA within COAST_KM of a gauge takes its nearest gauge. Riverine gauges
+   (EXCLUDE_GAUGES, or "River" in the name) are not used. NWS coastal flood
+   and storm surge reports (NOAA Storm Events, step 8) are added as a second,
+   report-based flag through the ZCTA's main parish.
+
+Outputs (data/coastal/)
+  hurricane_zcta_2018.csv, coops_stations_LA.csv, coops_daily_max_2018.csv,
+  coops_station_flood_days_2018.csv, zcta_coastal_daily_2018.csv,
+  figures/fig17_coastal_hurricane_2018.png
+Usage : python 13_coastal_hurricane.py
+Needs : step 9 (ZCTA boundaries); optional: step 8 (Storm Events), step 10 (HURDAT2
+        cache), step 12 (rainfall)
+"""
+
+import argparse
+import re
+import time
+from pathlib import Path
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+
+# ----------------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------------
+PROJECT_DIR = Path(r"D:\Tufts\Wishlist\Sepideh_2")
+YEAR = 2018
+STATE = "LA"
+LOCAL_TZ = "America/Chicago"
+TC_MAX_KM = 500           # keep storm-ZCTA pairs whose closest approach is <= 500 km
+TC_FLAGS_KM = (100, 250)
+RAIN_WINDOW = (-2, 1)     # days relative to closest approach for storm rainfall
+COAST_KM = 40             # ZCTA uses a tide gauge within 40 km
+STATION_BBOX = (-94.6, 28.5, -88.3, 31.5)   # gauges in/near coastal Louisiana
+NHC_DATA = "https://www.nhc.noaa.gov/data/"
+MDAPI = "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi"
+DATAGETTER = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
+APP = "LA_flood_health_study"
+FLOOD_ORDER = {"none": 0, "minor": 1, "moderate": 2, "major": 3}
+# Gauges whose high water is RIVER flooding, not coastal flooding. Their tidal range is
+# tiny, so the coastal thresholds are meaningless there (their floods are already in
+# the big-river category). Any gauge with "River" in its name is also excluded.
+EXCLUDE_GAUGES = {"8764044": "Berwick, Atchafalaya River - riverine high water"}
+
+
+def set_paths(project_dir):
+    global D, OUT, FIG
+    D = project_dir / "data"
+    OUT = D / "coastal"
+    FIG = OUT / "figures"
+    FIG.mkdir(parents=True, exist_ok=True)
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(np.radians, (lat1, lon1, lat2, lon2))
+    a = (np.sin((lat2 - lat1) / 2) ** 2
+         + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2)
+    return 6371 * 2 * np.arcsin(np.sqrt(a))
+
+
+def local_date(ts_utc):
+    t = pd.to_datetime(ts_utc)
+    if getattr(t.dt, "tz", None) is None:
+        t = t.dt.tz_localize("UTC")
+    return t.dt.tz_convert(LOCAL_TZ).dt.tz_localize(None).dt.normalize()
+
+
+def category(kt):
+    return np.select([kt >= 137, kt >= 113, kt >= 96, kt >= 83, kt >= 64, kt >= 34],
+                     ["Cat 5", "Cat 4", "Cat 3", "Cat 2", "Cat 1", "Tropical storm"],
+                     "Tropical depression")
+
+
+# ----------------------------------------------------------------------------
+# A. HURRICANES
+# ----------------------------------------------------------------------------
+def load_hurdat(user_file=None):
+    cache = D / "hurdat"
+    cache.mkdir(exist_ok=True)
+    if user_file:
+        path = Path(user_file)
+    else:
+        found = sorted(cache.glob("hurdat2-1851-*.txt"))
+        if found:
+            path = found[-1]
+        else:
+            html = requests.get(NHC_DATA, timeout=60).text
+            names = sorted(set(re.findall(r"hurdat2-1851-\d{4}-\d{6}\.txt", html)))
+            if not names:
+                raise RuntimeError("HURDAT2 file not found; pass --hurdat-file")
+            r = requests.get(NHC_DATA + "hurdat/" + names[-1], timeout=300)
+            r.raise_for_status()
+            path = cache / names[-1]
+            path.write_bytes(r.content)
+    rows, sid, name = [], None, None
+    for line in path.read_text().splitlines():
+        p = [x.strip() for x in line.split(",")]
+        if len(p) >= 3 and p[0][:2] == "AL" and len(p) < 8:
+            sid, name = p[0], p[1].title()
+            continue
+        if len(p) > 6 and p[0][:4] == str(YEAR):
+            lat = float(p[4][:-1]) * (1 if p[4][-1] == "N" else -1)
+            lon = float(p[5][:-1]) * (-1 if p[5][-1] == "W" else 1)
+            rows.append({"nhc_id": sid, "storm_name": name,
+                         "time": pd.to_datetime(p[0] + p[1].zfill(4), format="%Y%m%d%H%M"),
+                         "lat": lat, "lon": lon, "status": p[3],
+                         "wind_kt": pd.to_numeric(p[6], errors="coerce")})
+    return pd.DataFrame(rows)
+
+
+def hurricane_exposure(z, tracks, rain_daily):
+    cent = z.set_index("zcta").geometry.to_crs(3857).centroid.to_crs(4326)
+    zl, zo = cent.y.to_numpy(), cent.x.to_numpy()
+    out = []
+    for (sid, name), g in tracks.groupby(["nhc_id", "storm_name"]):
+        g = g.sort_values("time").drop_duplicates("time").set_index("time")
+        hourly = g[["lat", "lon", "wind_kt"]].resample("1h").interpolate()
+        hourly["status"] = g["status"].reindex(hourly.index, method="ffill")
+        d = haversine_km(zl[:, None], zo[:, None], hourly.lat.to_numpy()[None, :],
+                         hourly.lon.to_numpy()[None, :])
+        k = d.argmin(axis=1)
+        dmin = d[np.arange(len(zl)), k]
+        keep = dmin <= TC_MAX_KM
+        if not keep.any():
+            continue
+        t = hourly.index[k]
+        df = pd.DataFrame({"nhc_id": sid, "storm_name": name, "zcta": cent.index,
+                           "closest_time_utc": t, "dist_km": dmin.round(1),
+                           "storm_wind_kt": hourly.wind_kt.to_numpy()[k],
+                           "storm_status": hourly.status.to_numpy()[k]})[keep]
+        out.append(df)
+    if not out:
+        return pd.DataFrame()
+    h = pd.concat(out, ignore_index=True)
+    h["closest_date_local"] = local_date(h.closest_time_utc)
+    h["storm_category"] = category(h.storm_wind_kt.fillna(0))
+    for km in TC_FLAGS_KM:
+        h[f"within_{km}km"] = h.dist_km <= km
+    if rain_daily is not None:
+        r = rain_daily.set_index(["zcta", "date"]).rain_total_mm
+        tot = []
+        for zc, dd in zip(h.zcta, h.closest_date_local):
+            days = pd.date_range(dd + pd.Timedelta(days=RAIN_WINDOW[0]),
+                                 dd + pd.Timedelta(days=RAIN_WINDOW[1]))
+            tot.append(sum(r.get((zc, x), 0.0) for x in days))
+        h["storm_rain_mm"] = np.round(tot, 1)
+    return h.sort_values(["closest_time_utc", "zcta"])
+
+
+# ----------------------------------------------------------------------------
+# B. COASTAL WATER LEVELS
+# ----------------------------------------------------------------------------
+def coops_stations():
+    cache = OUT / "coops_stations_LA.csv"
+    if cache.exists():
+        return pd.read_csv(cache, dtype={"station_id": str})
+    js = requests.get(f"{MDAPI}/stations.json", params={"type": "waterlevels"}, timeout=120).json()
+    rows = []
+    for s in js.get("stations", []):
+        lat, lon = s.get("lat"), s.get("lng")
+        if lat is None or lon is None:
+            continue
+        if STATION_BBOX[0] <= lon <= STATION_BBOX[2] and STATION_BBOX[1] <= lat <= STATION_BBOX[3]:
+            rows.append({"station_id": str(s["id"]), "name": s.get("name"), "state": s.get("state"),
+                         "lat": lat, "lon": lon})
+    st = pd.DataFrame(rows)
+    mhhw, mllw = [], []
+    for sid in st.station_id:
+        try:
+            dj = requests.get(f"{MDAPI}/stations/{sid}/datums.json", params={"units": "metric"},
+                              timeout=60).json()
+            dat = {x["name"]: x["value"] for x in dj.get("datums", [])}
+            mhhw.append(dat.get("MHHW"))
+            mllw.append(dat.get("MLLW"))
+        except Exception:
+            mhhw.append(None)
+            mllw.append(None)
+        time.sleep(0.2)
+    st["MHHW"], st["MLLW"] = pd.to_numeric(mhhw), pd.to_numeric(mllw)
+    st["GT_m"] = st.MHHW - st.MLLW
+    st["minor_m_mhhw"] = 0.04 * st.GT_m + 0.50
+    st["moderate_m_mhhw"] = 0.03 * st.GT_m + 0.80
+    st["major_m_mhhw"] = 0.04 * st.GT_m + 1.17
+    st.to_csv(cache, index=False)
+    return st
+
+
+def _get_levels(sid, product, begin, end):
+    params = {"station": sid, "product": product, "datum": "MHHW", "units": "metric",
+              "time_zone": "gmt", "format": "json", "begin_date": begin.strftime("%Y%m%d"),
+              "end_date": end.strftime("%Y%m%d"), "application": APP}
+    try:
+        js = requests.get(DATAGETTER, params=params, timeout=120).json()
+        return [(x["t"], x["v"]) for x in js.get("data", [])]
+    except Exception:
+        return []
+
+
+def coops_daily(st):
+    """Daily maximum water level (m above MHHW) per gauge.
+    First tries verified hourly heights; if a gauge has none (common for some
+    Louisiana/Texas gauges), falls back to 6-minute water levels, requested in
+    15-day pieces (the API allows at most 31 days of 6-minute data per call)."""
+    cache = OUT / f"coops_daily_max_{YEAR}.csv"
+    nodata_file = OUT / f"coops_no_data_{YEAR}.txt"
+    old = (pd.read_csv(cache, dtype={"station_id": str}, parse_dates=["date"])
+           if cache.exists() else pd.DataFrame(columns=["station_id", "date", "wl_max_m_mhhw", "product"]))
+    tried = set(nodata_file.read_text().split()) if nodata_file.exists() else set()
+    usable = st.dropna(subset=["GT_m"])
+    # only gauges that are not in the saved file yet (and not already tried without success)
+    usable = usable[~usable.station_id.isin(set(old.station_id) | tried)]
+    if usable.empty:
+        return old
+    print(f"  downloading water levels for {len(usable)} gauge(s) ...")
+    rows = [old] if len(old) else []
+    no_data = set(tried)
+    start, stop = pd.Timestamp(YEAR - 1, 12, 31), pd.Timestamp(YEAR + 1, 1, 1)
+    for sid in usable.station_id:
+        vals, product = [], "hourly_height"
+        for m in range(1, 13):
+            b = pd.Timestamp(YEAR, m, 1) - (pd.Timedelta(days=1) if m == 1 else pd.Timedelta(0))
+            e = (pd.Timestamp(YEAR, m, 1) + pd.offsets.MonthEnd(0)) + \
+                (pd.Timedelta(days=1) if m == 12 else pd.Timedelta(0))
+            vals += _get_levels(sid, "hourly_height", b, e)
+            time.sleep(0.2)
+        if not vals:                                  # fallback: 6-minute data
+            product = "water_level"
+            for b in pd.date_range(start, stop, freq="15D"):
+                e = min(b + pd.Timedelta(days=14), stop)
+                vals += _get_levels(sid, "water_level", b, e)
+                time.sleep(0.2)
+        if not vals:
+            print(f"  station {sid}: no water levels relative to MHHW")
+            no_data.add(sid)
+            continue
+        w = pd.DataFrame(vals, columns=["t", "v"])
+        w["v"] = pd.to_numeric(w.v, errors="coerce")
+        w["date"] = local_date(pd.to_datetime(w.t).dt.tz_localize("UTC"))
+        dmax = w.groupby("date").v.max().reset_index(name="wl_max_m_mhhw")
+        dmax["station_id"] = sid
+        dmax["product"] = product
+        rows.append(dmax)
+        print(f"  station {sid}: {len(dmax)} days ({product})")
+    cols = ["station_id", "date", "wl_max_m_mhhw", "product"]
+    dd = pd.concat(rows, ignore_index=True).reindex(columns=cols) if rows else pd.DataFrame(columns=cols)
+    dd = dd[pd.to_datetime(dd.date).dt.year == YEAR]
+    dd.to_csv(cache, index=False)
+    nodata_file.write_text("\n".join(sorted(no_data)))
+    return dd
+
+
+def station_summary(st, dd):
+    """Flood days per gauge - a quick sanity check against NOAA's own counts."""
+    if dd.empty:
+        return pd.DataFrame()
+    sti = st.set_index("station_id")
+    x = dd.copy()
+    x["class"] = [classify(v, sti.loc[s]) for s, v in zip(x.station_id, x.wl_max_m_mhhw)]
+    t = (x.assign(minor_or_more=x["class"] != "none", moderate_or_more=x["class"].isin(["moderate", "major"]))
+         .groupby("station_id").agg(days=("date", "size"), minor_or_more=("minor_or_more", "sum"),
+                                    moderate_or_more=("moderate_or_more", "sum"),
+                                    max_wl_m_mhhw=("wl_max_m_mhhw", "max")))
+    t = t.join(sti[["name", "GT_m", "minor_m_mhhw", "moderate_m_mhhw"]])
+    t["used"] = ~t.index.isin(excluded(st))
+    t.to_csv(OUT / f"coops_station_flood_days_{YEAR}.csv")
+    return t.sort_values("minor_or_more", ascending=False)
+
+
+def classify(wl, st_row):
+    if not np.isfinite(wl):
+        return "none"
+    if wl >= st_row.major_m_mhhw:
+        return "major"
+    if wl >= st_row.moderate_m_mhhw:
+        return "moderate"
+    if wl >= st_row.minor_m_mhhw:
+        return "minor"
+    return "none"
+
+
+def excluded(st):
+    bad = st.station_id.isin(EXCLUDE_GAUGES) | st.name.fillna("").str.contains(r"\bRiver\b", case=False)
+    return set(st.loc[bad, "station_id"])
+
+
+def zcta_coastal_daily(z, st, dd):
+    use = st[st.station_id.isin(set(dd.station_id)) & ~st.station_id.isin(excluded(st))]
+    use = use.reset_index(drop=True)
+    cent = z.set_index("zcta").geometry.to_crs(3857).centroid.to_crs(4326)
+    if use.empty:
+        return pd.DataFrame()
+    d = haversine_km(cent.y.to_numpy()[:, None], cent.x.to_numpy()[:, None],
+                     use.lat.to_numpy()[None, :], use.lon.to_numpy()[None, :])
+    k, dmin = d.argmin(axis=1), d.min(axis=1)
+    m = pd.DataFrame({"zcta": cent.index, "station_id": use.station_id.to_numpy()[k],
+                      "station_dist_km": dmin.round(1)})
+    m = m[m.station_dist_km <= COAST_KM]
+    x = m.merge(dd, on="station_id")
+    sti = use.set_index("station_id")
+    x["coastal_flood_class"] = [classify(v, sti.loc[s]) for s, v in zip(x.station_id, x.wl_max_m_mhhw)]
+    x["wl_above_minor_m"] = (x.wl_max_m_mhhw - x.station_id.map(sti.minor_m_mhhw)).round(3)
+    return x
+
+
+def add_reports(zc_daily, z):
+    """NWS coastal flood / storm surge reports -> ZCTA-day flag via the main parish."""
+    p = D / "validation" / "storm_events_LA_2018.csv"
+    if not p.exists():
+        return zc_daily, 0
+    se = pd.read_csv(p, dtype=str)
+    se = se[se.EVENT_TYPE.isin(["Coastal Flood", "Storm Surge/Tide"])]
+    if se.empty:
+        return zc_daily, 0
+    se["b"] = pd.to_datetime(se.begin.str[:10])
+    se["e"] = pd.to_datetime(se.end.str[:10])
+    rows = []
+    zp = z[["zcta", "main_parish_fips"]].dropna()
+    for _, r in se.iterrows():
+        for zc in zp.loc[zp.main_parish_fips == r.parish_fips, "zcta"]:
+            for dd in pd.date_range(r.b, r.e):
+                rows.append({"zcta": zc, "date": dd, "coastal_report": r.EVENT_TYPE})
+    rep = pd.DataFrame(rows).groupby(["zcta", "date"]).coastal_report.apply(
+        lambda s: ";".join(sorted(set(s)))).reset_index()
+    if zc_daily.empty:
+        return rep, len(se)
+    out = zc_daily.merge(rep, on=["zcta", "date"], how="outer")
+    return out, len(se)
+
+
+# ----------------------------------------------------------------------------
+def figure(z, hur, zcd):
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5))
+    ax = axes[0]
+    z.plot(ax=ax, color="#f0f0f0", edgecolor="#bbbbbb", lw=0.2)
+    if len(hur):
+        near = hur.groupby("zcta").dist_km.min()
+        g = z.assign(d=z.zcta.map(near))
+        g[g.d.notna()].plot(ax=ax, column="d", cmap="magma", lw=0, legend=True,
+                            legend_kwds={"shrink": 0.6, "label": "closest storm distance (km)"})
+        ax.set_title(f"A. Closest tropical-cyclone approach, {YEAR}\n("
+                     + ", ".join(sorted(hur.storm_name.unique())) + ")", fontsize=10)
+    else:
+        ax.set_title("A. No tropical cyclone within range")
+    ax.set_axis_off()
+    ax = axes[1]
+    z.plot(ax=ax, color="#f0f0f0", edgecolor="#bbbbbb", lw=0.2)
+    if len(zcd) and "coastal_flood_class" in zcd:
+        n = zcd[zcd.coastal_flood_class.fillna("none") != "none"].groupby("zcta").size()
+        g = z.assign(n=z.zcta.map(n))
+        cov = set(zcd.zcta)
+        g[g.zcta.isin(cov)].plot(ax=ax, color="#c6dbef", lw=0)
+        if g.n.notna().any():
+            g[g.n.notna()].plot(ax=ax, column="n", cmap="Blues", lw=0, legend=True,
+                                legend_kwds={"shrink": 0.6, "label": "days >= minor"})
+    ax.set_title("B. Coastal flood days from tide gauges (light blue = covered, none)")
+    ax.set_axis_off()
+    fig.tight_layout()
+    fig.savefig(FIG / "fig17_coastal_hurricane_2018.png", dpi=160)
+    plt.close(fig)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project-dir", default=str(PROJECT_DIR))
+    ap.add_argument("--hurdat-file", default=None)
+    args = ap.parse_args()
+    set_paths(Path(args.project_dir))
+
+    z = gpd.read_file(D / "zcta" / "zcta_boundaries_LA.gpkg")
+    z["zcta"] = z.zcta.astype(str)
+    rp = D / "rain" / f"zcta_rain_daily_{YEAR}.csv"
+    rain = pd.read_csv(rp, dtype={"zcta": str}, parse_dates=["date"]) if rp.exists() else None
+
+    # ---- A. hurricanes -------------------------------------------------------
+    tracks = load_hurdat(args.hurdat_file)
+    hur = hurricane_exposure(z, tracks, rain)
+    hur.to_csv(OUT / f"hurricane_zcta_{YEAR}.csv", index=False)
+
+    # ---- B. coastal ------------------------------------------------------------
+    try:
+        st = coops_stations()
+        dd = coops_daily(st)
+        zcd = zcta_coastal_daily(z, st, dd)
+        ssum = station_summary(st, dd)
+    except Exception as exc:
+        print(f"  ! CO-OPS water levels unavailable ({str(exc)[:80]}) - reports only")
+        st, zcd, ssum = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    zcd, n_rep = add_reports(zcd, z)
+    zcd.to_csv(OUT / f"zcta_coastal_daily_{YEAR}.csv", index=False)
+    figure(z, hur, zcd)
+
+    # ---- summary -----------------------------------------------------------------
+    print(f"\nHURRICANE EXPOSURE {YEAR}")
+    if len(hur):
+        s = hur.groupby("storm_name").agg(zctas=("zcta", "size"), min_km=("dist_km", "min"),
+                                          date=("closest_date_local", "min"),
+                                          wind_kt=("storm_wind_kt", "max"))
+        s["zctas_within_100km"] = hur[hur.within_100km].groupby("storm_name").size()
+        print(s.fillna(0).to_string())
+    else:
+        print("  no tropical cyclone within", TC_MAX_KM, "km")
+    print(f"\nCOASTAL FLOODING {YEAR}")
+    if len(st):
+        print(f"  tide gauges in/near Louisiana: {len(st)}; with flood thresholds: "
+              f"{int(st.GT_m.notna().sum())}")
+    if len(zcd) and "coastal_flood_class" in zcd:
+        c = zcd.coastal_flood_class.fillna("none")
+        print(f"  coastal ZCTAs covered by a gauge: {zcd.dropna(subset=['station_id']).zcta.nunique()}")
+        print("  ZCTA-days by class: " + ", ".join(f"{k} {v}" for k, v in c.value_counts().items()))
+    print(f"  NWS coastal flood / surge reports used: {n_rep}")
+    if len(ssum):
+        print("\n  Flood days per gauge (compare with NOAA's annual high-tide-flooding counts):")
+        print(ssum[["name", "days", "minor_or_more", "moderate_or_more", "max_wl_m_mhhw", "GT_m", "used"]]
+              .round(2).to_string())
+        if (~ssum.used).any():
+            print("  (used = False: riverine gauge, excluded from coastal flooding)")
+    print(f"Outputs in {OUT}")
+
+
+if __name__ == "__main__":
+    main()
